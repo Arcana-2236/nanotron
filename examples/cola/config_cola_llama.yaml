@@ -62,6 +62,7 @@ model:
     num_key_value_heads: 4
     pad_token_id: null
     pretraining_tp: 1
+    rank: 4
     rms_norm_eps: 1.0e-05
     rope_scaling: null
     tie_word_embeddings: true

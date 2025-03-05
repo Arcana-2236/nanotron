@@ -55,6 +55,7 @@ class ColaLlamaConfig():
     tie_word_embeddings: bool = False
     use_cache: bool = True
     vocab_size: int = 32000
+    rank: int = 1024
 
     def __post_init__(self):
         # NOTE: user don't set self._init_method, ModelArgs will set it

@@ -304,7 +304,7 @@ class _ColumnLinearAsyncCommunication(torch.autograd.Function):
         grad_output_first_dims, grad_output_last_dim = grad_output.shape[:-1], grad_output.shape[-1]
         total_tensor_first_dims, total_tensor_last_dim = total_tensor.shape[:-1], total_tensor.shape[-1]
         grad_output = grad_output.view(math.prod(grad_output_first_dims), grad_output_last_dim)
-        total_tensor = total_tensor.view(math.prod(total_tensor_first_dims), total_tensor_last_dim)
+        total_tensor = total_tensor.reshape(math.prod(total_tensor_first_dims), total_tensor_last_dim)
 
         handle2: Optional[dist.Work] = None
         if tp_mode is TensorParallelLinearMode.REDUCE_SCATTER:

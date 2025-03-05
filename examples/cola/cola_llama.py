@@ -14,7 +14,7 @@
 # limitations under the License.
 """PyTorch LLaMa model."""
 
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Tuple
 
 import torch
 from torch import nn
@@ -22,7 +22,7 @@ from torch.utils.checkpoint import CheckpointFunction
 
 from nanotron import distributed as dist
 from nanotron import logging
-from nanotron.config import Config, LlamaConfig, ParallelismArgs
+from nanotron.config import Config, ParallelismArgs
 from nanotron.config.models_config import RandomInit, SpectralMupInit
 from nanotron.generation.generate_store import AttachableStore
 from nanotron.logging import log_rank
@@ -43,6 +43,8 @@ from nanotron.parallel.tensor_parallel.nn import (
 from nanotron.random import RandomStates
 from nanotron.scaling.parametrization import SpectralMupParametrizator, StandardParametrizator
 from nanotron.utils import checkpoint_method
+
+from config_cola_llama import ColaLlamaConfig
 
 logger = logging.get_logger(__name__)
 
@@ -201,53 +203,105 @@ class GLUActivation(nn.Module):
         return self.act(gate_states) * up_states
 
 
+class CoLALinear(nn.Module):
+    # TODO: TP strategy designed for CoLA
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int,
+        lr_act: str,
+        pg: dist.ProcessGroup,
+        mode: TensorParallelLinearMode,
+        bias: bool = False,
+        device=None,
+        dtype=None,
+        async_communication: bool = False,
+        contiguous_chunks: Optional[Tuple[int, ...]] = None,
+        tp_recompute_allgather: bool = True,
+    ):
+        super().__init__()
+
+        self.down_proj = TensorParallelColumnLinear(
+            in_features,
+            rank,
+            pg=pg,
+            mode=mode,
+            bias=False,
+            async_communication=async_communication,
+            tp_recompute_allgather=tp_recompute_allgather,
+        )
+        self.up_proj = TensorParallelRowLinear(
+            rank,
+            out_features,
+            pg=pg,
+            mode=mode,
+            bias=bias,
+            async_communication=async_communication and mode is TensorParallelLinearMode.REDUCE_SCATTER,
+        )
+        self.lr_act = ACT2FN[lr_act]
+
+    def forward(self, hidden_states):
+        hidden_states = self.down_proj(hidden_states)
+        hidden_states = self.lr_act(hidden_states)
+        hidden_states = self.up_proj(hidden_states)
+
+        return hidden_states
+
+        
+
 class MLP(nn.Module):
     def __init__(
         self,
-        config: LlamaConfig,
+        config: ColaLlamaConfig,
         parallel_config: Optional[ParallelismArgs],
         tp_pg: dist.ProcessGroup,
     ):
         super().__init__()
 
-        # TODO @thomasw21: refactor so that we store that default in a single place.
         tp_mode = parallel_config.tp_mode if parallel_config is not None else TensorParallelLinearMode.ALL_REDUCE
         tp_linear_async_communication = (
             parallel_config.tp_linear_async_communication if parallel_config is not None else False
         )
-
+        
+        # TODO: Not use contiguous chunks for now
         gate_up_contiguous_chunks = (
             config.intermediate_size,  # shape of gate_linear
             config.intermediate_size,  # shape of up_linear
         )
-        self.gate_up_proj = TensorParallelColumnLinear(
-            config.hidden_size,
+        self.gate_up_proj = CoLALinear(
+            2 * config.hidden_size,
             2 * config.intermediate_size,
-            pg=tp_pg,
+            config.rank,
+            lr_act=config.hidden_act,
             mode=tp_mode,
+            pg=tp_pg,
             bias=False,
             async_communication=tp_linear_async_communication,
             contiguous_chunks=gate_up_contiguous_chunks,
             tp_recompute_allgather=parallel_config.tp_recompute_allgather,
         )
-        self.down_proj = TensorParallelRowLinear(
+        self.down_proj = CoLALinear(
             config.intermediate_size,
             config.hidden_size,
-            pg=tp_pg,
+            config.rank,
+            lr_act=config.hidden_act,
             mode=tp_mode,
+            pg=tp_pg,
             bias=False,
-            async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
+            async_communication=tp_linear_async_communication,
+            tp_recompute_allgather=parallel_config.tp_recompute_allgather,
         )
-        self.split_silu_mul = GLUActivation(config.hidden_act)
 
     def forward(self, hidden_states):  # [seq_length, batch_size, hidden_dim]
-        merged_states = self.gate_up_proj(hidden_states)
-        hidden_states = self.down_proj(self.split_silu_mul(merged_states))
+        merged_states = self.gate_up_proj(torch.cat([hidden_states, hidden_states], dim=-1))
+        gate_states, up_states = torch.split(merged_states, merged_states.shape[-1] // 2, dim=-1)
+        hidden_states = self.down_proj(gate_states * up_states)
         return {"hidden_states": hidden_states}
 
 
 class CoreAttention(nn.Module):
-    def __init__(self, config: LlamaConfig, parallel_config: Optional[ParallelismArgs], layer_idx: int):
+    def __init__(self, config: ColaLlamaConfig, parallel_config: Optional[ParallelismArgs], layer_idx: int):
         super().__init__()
         # TODO @thomasw21: GPT has a weird `d_kv` config which I'm guessing is essentically a `d_qkv`
         assert (
@@ -331,7 +385,7 @@ def pad_to_right(tensor, mask, new_tensor=None):
 class CausalSelfAttention(nn.Module, AttachableStore):
     def __init__(
         self,
-        config: LlamaConfig,
+        config: ColaLlamaConfig,
         parallel_config: Optional[ParallelismArgs],
         tp_pg: dist.ProcessGroup,
         layer_idx: int,
@@ -381,16 +435,19 @@ class CausalSelfAttention(nn.Module, AttachableStore):
             config.num_key_value_heads * self.d_qk,  # shape of k
             config.num_key_value_heads * self.d_qk,  # shape of v
         )
-        self.qkv_proj = TensorParallelColumnLinear(
-            self.d_model,
+        self.qkv_proj = CoLALinear(
+            3 *self.d_model,
             config.num_attention_heads * self.d_qk + 2 * config.num_key_value_heads * self.d_qk,
-            pg=tp_pg,
+            config.rank,
+            lr_act=config.hidden_act,
             mode=tp_mode,
+            pg=tp_pg,
             bias=False,
             async_communication=tp_linear_async_communication,
             contiguous_chunks=qkv_contiguous_chunks,
             tp_recompute_allgather=parallel_config.tp_recompute_allgather,
         )
+        
         # TODO(kunhao): We want to have only one version per device and not one version per layer.
         if config.rope_interleaved:
             self.rotary_embedding = RotaryEmbedding(
@@ -411,13 +468,16 @@ class CausalSelfAttention(nn.Module, AttachableStore):
             dim=self.d_qk, base=config.rope_theta, interleaved=config.rope_interleaved
         )
 
-        self.o_proj = TensorParallelRowLinear(
+        self.o_proj = CoLALinear(
             config.num_attention_heads * self.d_qk,
             self.d_model,
-            pg=tp_pg,
+            config.rank,
+            lr_act=config.hidden_act,
             mode=tp_mode,
+            pg=tp_pg,
             bias=False,
             async_communication=tp_linear_async_communication,
+            tp_recompute_allgather=parallel_config.tp_recompute_allgather,
         )
 
         self.attention = CoreAttention(
@@ -441,8 +501,9 @@ class CausalSelfAttention(nn.Module, AttachableStore):
             flash_attn_with_kvcache,
         )
 
+        # Here concatenate hidden_states 3 times, not change the reduction dimension
         qkv_states = self.qkv_proj(
-            hidden_states
+            torch.cat([hidden_states, hidden_states, hidden_states], dim=-1)
         )  # [seq_length, batch_size, n_local_q_heads * d_qk + 2 * n_local_kv_heads * d_qk]
         q_length, batch_size, _ = qkv_states.shape
 
@@ -695,7 +756,7 @@ class CausalSelfAttention(nn.Module, AttachableStore):
 class LlamaDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: LlamaConfig,
+        config: ColaLlamaConfig,
         parallel_config: Optional[ParallelismArgs],
         tp_pg: dist.ProcessGroup,
         layer_idx: int,
@@ -758,7 +819,7 @@ class LlamaDecoderLayer(nn.Module):
 
 
 class Embedding(nn.Module, AttachableStore):
-    def __init__(self, tp_pg: dist.ProcessGroup, config: LlamaConfig, parallel_config: Optional[ParallelismArgs]):
+    def __init__(self, tp_pg: dist.ProcessGroup, config: ColaLlamaConfig, parallel_config: Optional[ParallelismArgs]):
         super().__init__()
         self.token_embedding = TensorParallelEmbedding(
             num_embeddings=config.vocab_size,
@@ -792,7 +853,7 @@ class LlamaModel(nn.Module):
 
     def __init__(
         self,
-        config: LlamaConfig,
+        config: ColaLlamaConfig,
         parallel_context: ParallelContext,
         parallel_config: Optional[ParallelismArgs],
     ):
@@ -981,7 +1042,7 @@ class Loss(nn.Module):
 class ColaLlamaForTraining(NanotronModel):
     def __init__(
         self,
-        config: LlamaConfig,
+        config: ColaLlamaConfig,
         parallel_context: ParallelContext,
         parallel_config: Optional[ParallelismArgs],
         random_states: Optional[RandomStates] = None,
