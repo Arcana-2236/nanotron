@@ -275,7 +275,9 @@ class OneForwardOneBackwardPipelineEngine(PipelineEngine):
 
             for micro_batch in batch:
                 context = self._get_fwd_context(model=model)
+                torch.cuda.nvtx.range_push("forward on rank{}".format(current_pp_rank))
                 output = self.forward(context=context, state=state, micro_batch=micro_batch, model=model)
+                torch.cuda.nvtx.range_pop()
 
                 # We make `output` a dict
                 if not isinstance(output, dict):
@@ -292,7 +294,9 @@ class OneForwardOneBackwardPipelineEngine(PipelineEngine):
                     nb_backwards=state.nb_backwards,
                     grad_accumulator=grad_accumulator,
                 )
+                torch.cuda.nvtx.range_push("backward on rank{}".format(current_pp_rank))
                 self.backward(context=context, state=state, grad_accumulator=grad_accumulator)
+                torch.cuda.nvtx.range_pop()
 
             # Check figure in paper: The remain blocks are all backward and there is only `pg.size() - current_pp_rank - 1` blocks left
             assert len(state.microbatches_activations_requiring_backward) == pg.size() - current_pp_rank - 1
@@ -304,12 +308,15 @@ class OneForwardOneBackwardPipelineEngine(PipelineEngine):
                 len(state.microbatches_activations_to_recv) == 0
             ), f"There are activations left for me to recv still: {len(state.microbatches_activations_to_recv)}"
 
+            torch.cuda.nvtx.range_push("rest of backward")
             # Close: compute backward for the rest
             # TODO @thomasw21: Somehow this needs to be done somewhere else to support interleaving. Somewhere right after a "stage"
+            torch.cuda.nvtx.range_push("communication for pp backward")
             for _ in range(len(state.microbatches_grads_to_send)):
                 send_grads = state.microbatches_grads_to_send.popleft()
                 # Execute
                 send_grads()
+            torch.cuda.nvtx.range_pop()
             for _ in range(len(state.microbatches_activations_requiring_backward)):
                 context = self._get_bwd_context(
                     model=model,
@@ -323,6 +330,7 @@ class OneForwardOneBackwardPipelineEngine(PipelineEngine):
                     send_grads = state.microbatches_grads_to_send.popleft()
                     # Execute
                     send_grads()
+            torch.cuda.nvtx.range_pop()
 
             # Make sure that micro batches are all fully consumed
             state.check_buffers_empty()

@@ -182,7 +182,7 @@ class DistributedTrainer:
             if hasattr(self.config.model.init_method, "use_mup") and self.config.model.init_method.use_mup
             else ParametrizationMethod.STANDARD
         )
-
+        log_memory(logger=logger)
         # Init optimizer
         self.optimizer, self.grad_accumulator = init_optimizer_and_grad_accumulator(
             parametrization_method=parametrization_method,
@@ -190,6 +190,7 @@ class DistributedTrainer:
             optimizer_args=self.config.optimizer,
             parallel_context=self.parallel_context,
         )
+        log_memory(logger=logger)
         if self.init_checkpoint_path is not None and self.config.checkpoints.load_optimizer:
             load_optimizer(
                 optimizer=self.optimizer,
@@ -445,14 +446,21 @@ class DistributedTrainer:
         torch.cuda.empty_cache()
         with prof:
             for self.iteration_step in range(self.initial_iter_step, self.last_iter_step + 1):
+                if self.iteration_step == self.initial_iter_step + 5:
+                    torch.cuda.cudart().cudaProfilerStart()
+
                 if isinstance(prof, torch.profiler.profile):
                     prof.step()
 
                 self.iteration_start_time = time.time()
                 self._update_dataloader_based_on_training_stages(dataloader_or_dls)
 
+                if self.iteration_step >= self.initial_iter_step + 5:
+                    torch.cuda.nvtx.range_push("training_step{}".format(self.iteration_step))
                 # Training step
                 outputs, loss_avg = self.training_step(dataloader=self.current_dataloader)
+                if self.iteration_step >= self.initial_iter_step + 5:
+                    torch.cuda.nvtx.range_pop()
 
                 # Training Logs
                 # TODO(xrsrke): refactor using callbacks would be better
@@ -468,6 +476,9 @@ class DistributedTrainer:
                 # Checkpoint
                 if self.iteration_step % self.config.checkpoints.checkpoint_interval == 0:
                     self.save_checkpoint()
+                
+                if self.iteration_step == self.initial_iter_step + 5 + 3:
+                    torch.cuda.cudart().cudaProfilerStop()
 
         dist.barrier()  # let's wait for everyone before leaving
 
@@ -486,6 +497,8 @@ class DistributedTrainer:
         if self.iteration_step < self.initial_iter_step + 5:
             log_memory(logger=logger)
 
+        if self.iteration_step >= self.initial_iter_step + 5:
+            torch.cuda.nvtx.range_push("train_batch_iter")
         outputs = self.pipeline_engine.train_batch_iter(
             model=self.model,
             pg=self.parallel_context.pp_pg,
@@ -493,12 +506,16 @@ class DistributedTrainer:
             nb_microbatches=self.n_micro_batches_per_batch,
             grad_accumulator=self.grad_accumulator,
         )
+        if self.iteration_step >= self.initial_iter_step + 5:
+            torch.cuda.nvtx.range_pop()
 
         if self.iteration_step < self.initial_iter_step + 5:
             log_memory(logger=logger)
 
         after_tbi_sanity_checks(self.config, self.parallel_context, self.unwrapped_model, self.grad_accumulator)
 
+        if self.iteration_step >= self.initial_iter_step + 5:
+            torch.cuda.nvtx.range_push("sync_gradients_across_dp")
         if isinstance(self.model, DistributedDataParallel) and self.grad_accumulator is not None:
             # Wait for fp32 grads allreduce to finish to make sure grads are synced across DP
             assert (
@@ -524,7 +541,11 @@ class DistributedTrainer:
             parallel_context=self.parallel_context,
             grad_accumulator=self.grad_accumulator,
         )
+        if self.iteration_step >= self.initial_iter_step + 5:
+            torch.cuda.nvtx.range_pop()
 
+        if self.iteration_step >= self.initial_iter_step + 5:
+            torch.cuda.nvtx.range_push("clip_gradients")
         # Clip gradients
         if self.config.optimizer.clip_grad is not None:
             # Unwrap DDP
@@ -539,7 +560,11 @@ class DistributedTrainer:
                 grad_accumulator=self.grad_accumulator,
                 max_norm=self.config.optimizer.clip_grad,
             )
+        if self.iteration_step >= self.initial_iter_step + 5:
+            torch.cuda.nvtx.range_pop()
 
+        if self.iteration_step >= self.initial_iter_step + 5:
+            torch.cuda.nvtx.range_push("loss_avg")
         # Compute DP average loss and overlap with optimizer step
         if isinstance(outputs[0]["loss"], torch.Tensor):
             # This is an average on only one data rank.
@@ -551,7 +576,11 @@ class DistributedTrainer:
         else:
             loss_avg = None
             handle = None
+        if self.iteration_step >= self.initial_iter_step + 5:
+            torch.cuda.nvtx.range_pop()
 
+        if self.iteration_step >= self.initial_iter_step + 5:
+            torch.cuda.nvtx.range_push("optimizer_step")
         # Move optimizer states back to GPU before optimizer step
         if (
             self.init_checkpoint_path is not None
@@ -570,6 +599,9 @@ class DistributedTrainer:
 
         # Update the learning rate
         self.lr_scheduler.step()
+
+        if self.iteration_step >= self.initial_iter_step + 5:
+            torch.cuda.nvtx.range_pop()
 
         after_optim_step_sanity_checks(self.config, self.parallel_context, self.unwrapped_model, self.grad_accumulator)
 

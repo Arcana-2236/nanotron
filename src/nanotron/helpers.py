@@ -478,10 +478,10 @@ def get_profiler(config: Config):
             on_trace_ready = None
         prof = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            schedule=torch.profiler.schedule(wait=1, warmup=1, active=1, repeat=1, skip_first=3),
+            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1, skip_first=3),
             on_trace_ready=on_trace_ready,
-            # record_shapes=True,
-            # profile_memory=True,
+            record_shapes=True,
+            profile_memory=True,
             with_stack=True,
         )
     else:
