@@ -249,7 +249,9 @@ class OneForwardOneBackwardPipelineEngine(PipelineEngine):
             for _ in range(pg.size() - current_pp_rank - 1):
                 micro_batch = next(batch)
                 context = self._get_fwd_context(model=model)
+                torch.cuda.nvtx.range_push("forward on rank{}".format(current_pp_rank))
                 output = self.forward(context=context, state=state, micro_batch=micro_batch, model=model)
+                torch.cuda.nvtx.range_pop()
 
                 # TODO @thomasw21: Somehow this needs to be done somewhere else to support interleaving. Somewhere right after a "stage"
                 for _ in range(len(state.microbatches_activations_to_send)):

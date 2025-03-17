@@ -440,12 +440,12 @@ class CausalSelfAttention(nn.Module, AttachableStore):
             flash_attn_varlen_func,
             flash_attn_with_kvcache,
         )
-
+        torch.cuda.nvtx.range_push("qkv_proj")
         qkv_states = self.qkv_proj(
             hidden_states
         )  # [seq_length, batch_size, n_local_q_heads * d_qk + 2 * n_local_kv_heads * d_qk]
         q_length, batch_size, _ = qkv_states.shape
-
+        torch.cuda.nvtx.range_pop()
         if self.is_gqa:
             query_states, key_states, value_states = torch.split(
                 qkv_states,
@@ -467,11 +467,13 @@ class CausalSelfAttention(nn.Module, AttachableStore):
                 value_states.transpose(0, 1).contiguous().view(batch_size, q_length, self.n_local_kv_heads, self.d_qk)
             )
         else:
+            torch.cuda.nvtx.range_push("qkv_states reshape")
             query_states, key_states, value_states = (
                 qkv_states.view(q_length, batch_size, 3, self.n_local_q_heads, self.d_qk)
                 .permute(2, 1, 0, 3, 4)
                 .contiguous()
             )  # [3, batch_size, seq_length, n_local_q_heads, d_qk]
+            torch.cuda.nvtx.range_pop()
 
         store = self.get_local_store()
         if store is not None:  # Inference case
@@ -655,7 +657,9 @@ class CausalSelfAttention(nn.Module, AttachableStore):
             key_value_states = torch.cat([key_states.unsqueeze(0), value_states.unsqueeze(0)], dim=0)
             # [batch_size, seq_length, 2, num_heads, d_qk]
             key_value_states = key_value_states.permute(1, 2, 0, 3, 4).contiguous()
+            torch.cuda.nvtx.range_push("flash_rotary_embedding")
             query_states, key_value_states = self.flash_rotary_embedding(query_states, kv=key_value_states)
+            torch.cuda.nvtx.range_pop()
             # [batch_size, seq_length, num_heads, d_qk]
             key_states, value_states = torch.split(key_value_states, 1, dim=2)
 
@@ -676,6 +680,7 @@ class CausalSelfAttention(nn.Module, AttachableStore):
                 batch_size * kv_length, self.n_local_kv_heads, self.d_v
             )  # [batch_size * kv_length, self.n_heads, d_v]
 
+            torch.cuda.nvtx.range_push("core flash attention")
             attention_output = self.attention(
                 query_states=query_states,
                 key_states=key_states,
@@ -683,11 +688,14 @@ class CausalSelfAttention(nn.Module, AttachableStore):
                 q_sequence_mask=q_sequence_mask,
                 kv_sequence_mask=kv_sequence_mask,
             )
+            torch.cuda.nvtx.range_pop()
 
         attention_output = (
             attention_output.contiguous().view(batch_size, q_length, self.n_local_q_heads * self.d_v).transpose(0, 1)
         )
+        torch.cuda.nvtx.range_push("o_proj")
         output = self.o_proj(attention_output)
+        torch.cuda.nvtx.range_pop()
 
         return {"hidden_states": output, "sequence_mask": sequence_mask}
 
@@ -720,15 +728,24 @@ class LlamaDecoderLayer(nn.Module):
         sequence_mask: Union[torch.Tensor, TensorPointer],
     ) -> List[Union[torch.Tensor, TensorPointer]]:
         residual = hidden_states
+        torch.cuda.nvtx.range_push("attn_layernorm")
         hidden_states = self.input_layernorm(hidden_states)
+        torch.cuda.nvtx.range_pop()
 
+        torch.cuda.nvtx.range_push("attn")
         output = self.attn(hidden_states=hidden_states, sequence_mask=sequence_mask)
+        torch.cuda.nvtx.range_pop()
         hidden_states = output["hidden_states"]
         hidden_states = hidden_states + residual
 
         residual = hidden_states
+        torch.cuda.nvtx.range_push("post_attention_layernorm")
         hidden_states = self.post_attention_layernorm(hidden_states)
+        torch.cuda.nvtx.range_pop()
+
+        torch.cuda.nvtx.range_push("mlp")
         hidden_states = self.mlp(hidden_states=hidden_states)["hidden_states"]
+        torch.cuda.nvtx.range_pop()
         hidden_states = hidden_states + residual
 
         return hidden_states, output["sequence_mask"]

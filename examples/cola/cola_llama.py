@@ -501,12 +501,13 @@ class CausalSelfAttention(nn.Module, AttachableStore):
             flash_attn_with_kvcache,
         )
 
+        torch.cuda.nvtx.range_push("qkv_proj")
         # Here concatenate hidden_states 3 times, not change the reduction dimension
         qkv_states = self.qkv_proj(
             torch.cat([hidden_states, hidden_states, hidden_states], dim=-1)
         )  # [seq_length, batch_size, n_local_q_heads * d_qk + 2 * n_local_kv_heads * d_qk]
         q_length, batch_size, _ = qkv_states.shape
-
+        torch.cuda.nvtx.range_pop()
         if self.is_gqa:
             query_states, key_states, value_states = torch.split(
                 qkv_states,
@@ -528,11 +529,13 @@ class CausalSelfAttention(nn.Module, AttachableStore):
                 value_states.transpose(0, 1).contiguous().view(batch_size, q_length, self.n_local_kv_heads, self.d_qk)
             )
         else:
+            torch.cuda.nvtx.range_push("view and permute")
             query_states, key_states, value_states = (
                 qkv_states.view(q_length, batch_size, 3, self.n_local_q_heads, self.d_qk)
                 .permute(2, 1, 0, 3, 4)
                 .contiguous()
             )  # [3, batch_size, seq_length, n_local_q_heads, d_qk]
+            torch.cuda.nvtx.range_pop()
 
         store = self.get_local_store()
         if store is not None:  # Inference case
@@ -713,10 +716,16 @@ class CausalSelfAttention(nn.Module, AttachableStore):
             # NOTE: The layout is different from models/llama.py which is [batch_size, num_heads, seq_length, d_qk]
             # Here it is, [batch_size, seq_length, num_heads, d_qk]
             # [2, batch_size, seq_length, num_heads, d_qk]
+            torch.cuda.nvtx.range_push("cat")
             key_value_states = torch.cat([key_states.unsqueeze(0), value_states.unsqueeze(0)], dim=0)
+            torch.cuda.nvtx.range_pop()
             # [batch_size, seq_length, 2, num_heads, d_qk]
+            torch.cuda.nvtx.range_push("permute")
             key_value_states = key_value_states.permute(1, 2, 0, 3, 4).contiguous()
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("flash_rotary_embedding")
             query_states, key_value_states = self.flash_rotary_embedding(query_states, kv=key_value_states)
+            torch.cuda.nvtx.range_pop()
             # [batch_size, seq_length, num_heads, d_qk]
             key_states, value_states = torch.split(key_value_states, 1, dim=2)
 
@@ -737,6 +746,7 @@ class CausalSelfAttention(nn.Module, AttachableStore):
                 batch_size * kv_length, self.n_local_kv_heads, self.d_v
             )  # [batch_size * kv_length, self.n_heads, d_v]
 
+            torch.cuda.nvtx.range_push("core flash attention")
             attention_output = self.attention(
                 query_states=query_states,
                 key_states=key_states,
@@ -744,11 +754,13 @@ class CausalSelfAttention(nn.Module, AttachableStore):
                 q_sequence_mask=q_sequence_mask,
                 kv_sequence_mask=kv_sequence_mask,
             )
-
+            torch.cuda.nvtx.range_pop()
         attention_output = (
             attention_output.contiguous().view(batch_size, q_length, self.n_local_q_heads * self.d_v).transpose(0, 1)
         )
+        torch.cuda.nvtx.range_push("o_proj")
         output = self.o_proj(attention_output)
+        torch.cuda.nvtx.range_pop()
 
         return {"hidden_states": output, "sequence_mask": sequence_mask}
 
@@ -781,15 +793,24 @@ class LlamaDecoderLayer(nn.Module):
         sequence_mask: Union[torch.Tensor, TensorPointer],
     ) -> List[Union[torch.Tensor, TensorPointer]]:
         residual = hidden_states
+        torch.cuda.nvtx.range_push("attn_layernorm")
         hidden_states = self.input_layernorm(hidden_states)
+        torch.cuda.nvtx.range_pop()
 
+        torch.cuda.nvtx.range_push("attn")
         output = self.attn(hidden_states=hidden_states, sequence_mask=sequence_mask)
+        torch.cuda.nvtx.range_pop()
         hidden_states = output["hidden_states"]
         hidden_states = hidden_states + residual
 
         residual = hidden_states
+        torch.cuda.nvtx.range_push("post_attention_layernorm")
         hidden_states = self.post_attention_layernorm(hidden_states)
+        torch.cuda.nvtx.range_pop()
+
+        torch.cuda.nvtx.range_push("mlp")
         hidden_states = self.mlp(hidden_states=hidden_states)["hidden_states"]
+        torch.cuda.nvtx.range_pop()
         hidden_states = hidden_states + residual
 
         return hidden_states, output["sequence_mask"]
@@ -1000,6 +1021,7 @@ class LlamaModel(nn.Module):
             num_key_value_heads=num_key_values_heads,
             vocab_size=self.config.vocab_size,
             ffn_hidden_size=self.config.intermediate_size,
+            rank=self.config.rank,
             seq_len=sequence_length,
             batch_size=global_batch_size,
         )
@@ -1166,15 +1188,17 @@ def get_flops(
     vocab_size,
     seq_len,
     ffn_hidden_size,
+    rank,
     batch_size=1,
 ):
-    """Counts flops in an decoder-only model
+    """Counts flops in cola-llama model
     Args:
         num_layers: number of decoder layers
         hidden_size: hidden size of the model
         num_heads: number of heads in the model
         num_key_value_heads: number of key/value heads in the model
         ffn_hidden_size: hidden size of the FFN
+        rank: rank of SVD part
         vocab_size: size of the vocabulary
         seq_len: sequence length of the decoder
         batch_size: batch size
@@ -1190,8 +1214,8 @@ def get_flops(
     # self attention
     ## qkv projection
     decoder_qkv_proj_flops_fwd = (
-        2 * num_layers * batch_size * seq_len * (hidden_size) * num_heads * hidden_size_per_head
-        + 2 * num_layers * batch_size * seq_len * (hidden_size) * 2 * num_key_value_heads * hidden_size_per_head
+        2 * num_layers * batch_size * seq_len * ((hidden_size) * rank) + (rank * num_heads * hidden_size_per_head)
+        + 2 * 2 * num_layers * batch_size * seq_len * ((hidden_size) * rank) + (rank * num_key_value_heads * hidden_size_per_head)
     )
     ## qk logits
     decoder_qk_logits_flops_fwd = 2 * num_layers * batch_size * num_heads * seq_len * (hidden_size_per_head) * seq_len
@@ -1199,13 +1223,13 @@ def get_flops(
     decoder_v_logits_flops_fwd = 2 * num_layers * batch_size * num_heads * seq_len * (seq_len) * hidden_size_per_head
     ## attn out
     decoder_attn_out_flops_fwd = (
-        2 * num_layers * batch_size * num_heads * seq_len * (hidden_size_per_head) * hidden_size
+        2 * num_layers * batch_size * seq_len * (num_heads * (hidden_size_per_head) * rank) + (rank * hidden_size)
     )
     # FF
     ## 1st layer
-    decoder_ffn_1_flops_fwd = 4 * num_layers * batch_size * seq_len * (hidden_size) * ffn_hidden_size
+    decoder_ffn_1_flops_fwd = 4 * num_layers * batch_size * seq_len * ((hidden_size) * rank) + (rank * ffn_hidden_size)
     ## 2nd layer
-    decoder_ffn_2_flops_fwd = 2 * num_layers * batch_size * seq_len * (ffn_hidden_size) * hidden_size
+    decoder_ffn_2_flops_fwd = 2 * num_layers * batch_size * seq_len * ((ffn_hidden_size) * rank) + (rank * hidden_size)
 
     decoder_flops_fwd = (
         decoder_qkv_proj_flops_fwd
