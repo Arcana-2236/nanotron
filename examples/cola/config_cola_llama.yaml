@@ -1,5 +1,5 @@
 checkpoints:
-  checkpoint_interval: 10
+  checkpoint_interval: 20
   checkpoints_path: checkpoints
   checkpoints_path_is_shared_file_system: false
   resume_checkpoint_path: null
@@ -88,13 +88,13 @@ optimizer:
   weight_decay: 0.01
   zero_stage: 0
 parallelism:
-  dp: 4
+  dp: 1
   expert_parallel_size: 1
   pp: 1
   pp_engine: 1f1b
-  tp: 1
+  tp: 4
   tp_linear_async_communication: true
-  tp_mode: REDUCE_SCATTER
+  tp_mode: ALL_REDUCE
 profiler: null
 tokenizer:
   tokenizer_max_length: null
@@ -106,5 +106,5 @@ tokens:
   limit_val_batches: 0
   micro_batch_size: 2
   sequence_length: 256
-  train_steps: 15
+  train_steps: 8
   val_check_interval: -1

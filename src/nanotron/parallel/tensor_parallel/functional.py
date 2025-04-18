@@ -572,7 +572,7 @@ class _RowLinearAsyncCommunication(torch.autograd.Function):
             total_grad_output.shape[:-1],
             total_grad_output.shape[-1],
         )
-        total_grad_output = total_grad_output.view(math.prod(total_grad_output_first_dims), total_grad_output_last_dim)
+        total_grad_output = total_grad_output.reshape(math.prod(total_grad_output_first_dims), total_grad_output_last_dim)
 
         # TODO @thomasw21: This sounds like we don't have the optimal physical layout
         grad_weight = total_grad_output.t().matmul(tensor)

@@ -269,16 +269,26 @@ class MLP(nn.Module):
             config.intermediate_size,  # shape of gate_linear
             config.intermediate_size,  # shape of up_linear
         )
-        self.gate_up_proj = CoLALinear(
-            2 * config.hidden_size,
-            2 * config.intermediate_size,
+        self.gate_proj = CoLALinear(
+            config.hidden_size,
+            config.intermediate_size,
             config.rank,
             lr_act=config.hidden_act,
             mode=tp_mode,
             pg=tp_pg,
             bias=False,
             async_communication=tp_linear_async_communication,
-            contiguous_chunks=gate_up_contiguous_chunks,
+            tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+        )
+        self.up_proj = CoLALinear(
+            config.hidden_size,
+            config.intermediate_size,
+            config.rank,
+            lr_act=config.hidden_act,
+            mode=tp_mode,
+            pg=tp_pg,
+            bias=False,
+            async_communication=tp_linear_async_communication,
             tp_recompute_allgather=parallel_config.tp_recompute_allgather,
         )
         self.down_proj = CoLALinear(
@@ -294,8 +304,8 @@ class MLP(nn.Module):
         )
 
     def forward(self, hidden_states):  # [seq_length, batch_size, hidden_dim]
-        merged_states = self.gate_up_proj(torch.cat([hidden_states, hidden_states], dim=-1))
-        gate_states, up_states = torch.split(merged_states, merged_states.shape[-1] // 2, dim=-1)
+        gate_states = self.gate_proj(hidden_states)
+        up_states = self.up_proj(hidden_states)
         hidden_states = self.down_proj(gate_states * up_states)
         return {"hidden_states": hidden_states}
 
@@ -413,8 +423,10 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         assert (
             config.num_attention_heads % config.num_key_value_heads == 0
         ), f"Number of attention heads ({config.num_attention_heads}) must be divisible by number of key/value heads ({config.num_key_value_heads})."
-        self.n_local_q_heads = config.num_attention_heads // tp_pg.size()
-        self.n_local_kv_heads = config.num_key_value_heads // tp_pg.size()
+        # self.n_local_q_heads = config.num_attention_heads // tp_pg.size()
+        # self.n_local_kv_heads = config.num_key_value_heads // tp_pg.size()
+        self.n_local_q_heads = config.num_attention_heads
+        self.n_local_kv_heads = config.num_key_value_heads
         self.n_repeats = config.num_attention_heads // config.num_key_value_heads
         self.is_gqa = config.num_attention_heads != config.num_key_value_heads  # Whether we are using GQA or not
         self.d_qk = config.hidden_size // config.num_attention_heads
@@ -435,19 +447,41 @@ class CausalSelfAttention(nn.Module, AttachableStore):
             config.num_key_value_heads * self.d_qk,  # shape of k
             config.num_key_value_heads * self.d_qk,  # shape of v
         )
-        self.qkv_proj = CoLALinear(
-            3 *self.d_model,
-            config.num_attention_heads * self.d_qk + 2 * config.num_key_value_heads * self.d_qk,
+        self.q_proj = CoLALinear(
+            self.d_model,
+            config.num_attention_heads * self.d_qk,
             config.rank,
             lr_act=config.hidden_act,
-            mode=tp_mode,
             pg=tp_pg,
+            mode=tp_mode,
             bias=False,
             async_communication=tp_linear_async_communication,
-            contiguous_chunks=qkv_contiguous_chunks,
+            tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+        )
+        self.k_proj = CoLALinear(
+            self.d_model,
+            config.num_key_value_heads * self.d_qk,
+            config.rank,
+            lr_act=config.hidden_act,
+            pg=tp_pg,
+            mode=tp_mode,
+            bias=False,
+            async_communication=tp_linear_async_communication,
+            tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+        )
+        self.v_proj = CoLALinear(
+            self.d_model,
+            config.num_key_value_heads * self.d_qk,
+            config.rank,
+            lr_act=config.hidden_act,
+            pg=tp_pg,
+            mode=tp_mode,
+            bias=False,
+            async_communication=tp_linear_async_communication,
             tp_recompute_allgather=parallel_config.tp_recompute_allgather,
         )
         
+         
         # TODO(kunhao): We want to have only one version per device and not one version per layer.
         if config.rope_interleaved:
             self.rotary_embedding = RotaryEmbedding(
@@ -473,8 +507,8 @@ class CausalSelfAttention(nn.Module, AttachableStore):
             self.d_model,
             config.rank,
             lr_act=config.hidden_act,
-            mode=tp_mode,
             pg=tp_pg,
+            mode=tp_mode,
             bias=False,
             async_communication=tp_linear_async_communication,
             tp_recompute_allgather=parallel_config.tp_recompute_allgather,
@@ -503,39 +537,47 @@ class CausalSelfAttention(nn.Module, AttachableStore):
 
         torch.cuda.nvtx.range_push("qkv_proj")
         # Here concatenate hidden_states 3 times, not change the reduction dimension
-        qkv_states = self.qkv_proj(
-            torch.cat([hidden_states, hidden_states, hidden_states], dim=-1)
-        )  # [seq_length, batch_size, n_local_q_heads * d_qk + 2 * n_local_kv_heads * d_qk]
-        q_length, batch_size, _ = qkv_states.shape
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+        q_length, batch_size, _ = query_states.shape
+        query_states = query_states.view(q_length, batch_size, self.n_local_q_heads, self.d_qk).permute(1, 0, 2, 3).contiguous()
+        key_states = key_states.view(q_length, batch_size, self.n_local_kv_heads, self.d_qk).permute(1, 0, 2, 3).contiguous()   
+        value_states = value_states.view(q_length, batch_size, self.n_local_kv_heads, self.d_qk).permute(1, 0, 2, 3).contiguous()
+        # qkv_states = torch.cat([q_states, k_states, v_states], dim=-1)
+        # qkv_states = self.qkv_proj(
+        #     torch.cat([hidden_states, hidden_states, hidden_states], dim=-1)
+        # )  # [seq_length, batch_size, n_local_q_heads * d_qk + 2 * n_local_kv_heads * d_qk]
+        # q_length, batch_size, _ = qkv_states.shape
         torch.cuda.nvtx.range_pop()
-        if self.is_gqa:
-            query_states, key_states, value_states = torch.split(
-                qkv_states,
-                [
-                    self.n_local_q_heads * self.d_qk,
-                    self.n_local_kv_heads * self.d_qk,
-                    self.n_local_kv_heads * self.d_qk,
-                ],
-                dim=-1,
-            )
+        # if self.is_gqa:
+        #     query_states, key_states, value_states = torch.split(
+        #         qkv_states,
+        #         [
+        #             self.n_local_q_heads * self.d_qk,
+        #             self.n_local_kv_heads * self.d_qk,
+        #             self.n_local_kv_heads * self.d_qk,
+        #         ],
+        #         dim=-1,
+        #     )
 
-            query_states = (
-                query_states.transpose(0, 1).contiguous().view(batch_size, q_length, self.n_local_q_heads, self.d_qk)
-            )
-            key_states = (
-                key_states.transpose(0, 1).contiguous().view(batch_size, q_length, self.n_local_kv_heads, self.d_qk)
-            )
-            value_states = (
-                value_states.transpose(0, 1).contiguous().view(batch_size, q_length, self.n_local_kv_heads, self.d_qk)
-            )
-        else:
-            torch.cuda.nvtx.range_push("view and permute")
-            query_states, key_states, value_states = (
-                qkv_states.view(q_length, batch_size, 3, self.n_local_q_heads, self.d_qk)
-                .permute(2, 1, 0, 3, 4)
-                .contiguous()
-            )  # [3, batch_size, seq_length, n_local_q_heads, d_qk]
-            torch.cuda.nvtx.range_pop()
+        #     query_states = (
+        #         query_states.transpose(0, 1).contiguous().view(batch_size, q_length, self.n_local_q_heads, self.d_qk)
+        #     )
+        #     key_states = (
+        #         key_states.transpose(0, 1).contiguous().view(batch_size, q_length, self.n_local_kv_heads, self.d_qk)
+        #     )
+        #     value_states = (
+        #         value_states.transpose(0, 1).contiguous().view(batch_size, q_length, self.n_local_kv_heads, self.d_qk)
+        #     )
+        # else:
+        #     torch.cuda.nvtx.range_push("view and permute")
+        #     query_states, key_states, value_states = (
+        #         qkv_states.view(q_length, batch_size, 3, self.n_local_q_heads, self.d_qk)
+        #         .permute(2, 1, 0, 3, 4)
+        #         .contiguous()
+        #     )  # [3, batch_size, seq_length, n_local_q_heads, d_qk]
+        #     torch.cuda.nvtx.range_pop()
 
         store = self.get_local_store()
         if store is not None:  # Inference case
