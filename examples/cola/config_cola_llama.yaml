@@ -92,9 +92,9 @@ parallelism:
   expert_parallel_size: 1
   pp: 1
   pp_engine: 1f1b
-  tp: 4
+  tp: 1
   tp_linear_async_communication: true
-  tp_mode: ALL_REDUCE
+  tp_mode: REDUCE_SCATTER
 profiler: null
 tokenizer:
   tokenizer_max_length: null

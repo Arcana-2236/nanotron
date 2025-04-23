@@ -12,6 +12,7 @@ from nanotron.parallel.tensor_parallel.nn import (
 )
 from torch import nn
 from torch.nn import init
+from torch.nn import Linear
 
 
 class ParametrizationMethod(Enum):
@@ -24,6 +25,7 @@ class Parametrizator:
         self.config = config
 
     def parametrize(self, param_name: str, module: nn.Module):
+        # print(f"module: {module}")
         if not isinstance(module, tuple(self.MODULE_TO_PARAMETRIZE.keys())):
             raise Exception(f"Parameter {param_name} was not initialized")
 
@@ -38,6 +40,7 @@ class StandardParametrizator(Parametrizator):
             TensorParallelRowLinear: self._parametrize_row_linear,
             TritonRMSNorm: self._parametrize_layer_norm,
             TensorParallelEmbedding: self._parametrize_embedding,
+            Linear: self._parametrize_nn_linear,
         }
 
         self.std = config.init_method.std
@@ -74,6 +77,14 @@ class StandardParametrizator(Parametrizator):
 
         if "weight" == param_name:
             init.normal_(module.weight, mean=0.0, std=self.std)
+    
+    def _parametrize_nn_linear(self, param_name: str, module: nn.Module):
+        assert param_name in ["weight", "bias"]
+
+        if "weight" == param_name:
+            init.normal_(module.weight, mean=0.0, std=self.std)
+        elif "bias" == param_name:
+            module.bias.zero_()
 
 
 class SpectralMupParametrizator(Parametrizator):

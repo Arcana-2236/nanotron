@@ -39,6 +39,7 @@ from nanotron.parallel.tensor_parallel.nn import (
     TensorParallelEmbedding,
     TensorParallelLinearMode,
     TensorParallelRowLinear,
+    TiedLinear,
 )
 from nanotron.random import RandomStates
 from nanotron.scaling.parametrization import SpectralMupParametrizator, StandardParametrizator
@@ -269,44 +270,91 @@ class MLP(nn.Module):
             config.intermediate_size,  # shape of gate_linear
             config.intermediate_size,  # shape of up_linear
         )
-        self.gate_proj = CoLALinear(
-            config.hidden_size,
-            config.intermediate_size,
+        self.lr_act = ACT2FN[config.hidden_act]
+        # Now only support ALL_REDUCE mode
+        # A Row-wise TP Linear layer: hidden_size -> rank
+        # self.gate_proj0 = TensorParallelRowLinear(
+        #     config.hidden_size,
+        #     config.rank,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
+        # )
+        self.gate_proj0 = nn.Linear(config.hidden_size, config.rank, bias=False)
+        # A Column-wise TP Linear layer: rank -> intermediate_size
+        self.gate_proj1 = TensorParallelColumnLinear(
             config.rank,
-            lr_act=config.hidden_act,
-            mode=tp_mode,
+            config.intermediate_size,
             pg=tp_pg,
+            mode=tp_mode,
             bias=False,
             async_communication=tp_linear_async_communication,
-            tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+            # contiguous_chunks=gate_up_contiguous_chunks,
+            # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
         )
-        self.up_proj = CoLALinear(
-            config.hidden_size,
-            config.intermediate_size,
+        # A Row-wise TP Linear layer: hidden_size -> rank
+        # self.up_proj0 = TensorParallelRowLinear(
+        #     config.hidden_size,
+        #     config.rank,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
+        # )
+        self.up_proj0 = nn.Linear(config.hidden_size, config.rank, bias=False)
+        # A Column-wise TP Linear layer: rank -> intermediate_size
+        self.up_proj1 = TensorParallelColumnLinear(
             config.rank,
-            lr_act=config.hidden_act,
-            mode=tp_mode,
+            config.intermediate_size,
             pg=tp_pg,
+            mode=tp_mode,
             bias=False,
             async_communication=tp_linear_async_communication,
-            tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+            # contiguous_chunks=gate_up_contiguous_chunks,
+            # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
         )
-        self.down_proj = CoLALinear(
+        # A Row-wise TP Linear layer: intermediate_size -> rank
+        self.down_proj0 = TensorParallelRowLinear(
             config.intermediate_size,
-            config.hidden_size,
             config.rank,
-            lr_act=config.hidden_act,
-            mode=tp_mode,
             pg=tp_pg,
+            mode=tp_mode,
             bias=False,
-            async_communication=tp_linear_async_communication,
-            tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+            async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
         )
+        # A Column-wise TP Linear layer: rank -> hidden_size
+        # self.down_proj1 = TensorParallelColumnLinear(
+        #     config.rank,
+        #     config.hidden_size,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication,
+        #     # contiguous_chunks=gate_up_contiguous_chunks,
+        #     # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+        # )
+        self.down_proj1 = nn.Linear(config.rank, config.hidden_size, bias=False)
 
     def forward(self, hidden_states):  # [seq_length, batch_size, hidden_dim]
-        gate_states = self.gate_proj(hidden_states)
-        up_states = self.up_proj(hidden_states)
-        hidden_states = self.down_proj(gate_states * up_states)
+        # [seq_length, batch_size, rank]
+        lr_gate_states = self.gate_proj0(hidden_states)
+        lr_up_states = self.up_proj0(hidden_states)
+        # [seq_length, batch_size, rank]
+        lr_gate_states = self.lr_act(lr_gate_states)
+        lr_up_states = self.lr_act(lr_up_states)
+        # [seq_length, batch_size, intermediate_size/TP]
+        gate_states = self.gate_proj1(lr_gate_states)
+        up_states = self.up_proj1(lr_up_states)
+        # [seq_length, batch_size, intermediate_size/TP]
+        hidden_states = gate_states * up_states
+
+        # [seq_length, batch_size, rank]
+        hidden_states = self.down_proj0(hidden_states)
+        # [seq_length, batch_size, rank]
+        hidden_states = self.lr_act(hidden_states)
+        # [seq_length, batch_size, hidden_size/TP]
+        hidden_states = self.down_proj1(hidden_states)
         return {"hidden_states": hidden_states}
 
 
@@ -423,10 +471,10 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         assert (
             config.num_attention_heads % config.num_key_value_heads == 0
         ), f"Number of attention heads ({config.num_attention_heads}) must be divisible by number of key/value heads ({config.num_key_value_heads})."
-        # self.n_local_q_heads = config.num_attention_heads // tp_pg.size()
-        # self.n_local_kv_heads = config.num_key_value_heads // tp_pg.size()
-        self.n_local_q_heads = config.num_attention_heads
-        self.n_local_kv_heads = config.num_key_value_heads
+        self.n_local_q_heads = config.num_attention_heads // tp_pg.size()
+        self.n_local_kv_heads = config.num_key_value_heads // tp_pg.size()
+        # self.n_local_q_heads = config.num_attention_heads
+        # self.n_local_kv_heads = config.num_key_value_heads
         self.n_repeats = config.num_attention_heads // config.num_key_value_heads
         self.is_gqa = config.num_attention_heads != config.num_key_value_heads  # Whether we are using GQA or not
         self.d_qk = config.hidden_size // config.num_attention_heads
@@ -447,38 +495,69 @@ class CausalSelfAttention(nn.Module, AttachableStore):
             config.num_key_value_heads * self.d_qk,  # shape of k
             config.num_key_value_heads * self.d_qk,  # shape of v
         )
-        self.q_proj = CoLALinear(
-            self.d_model,
+        self.lr_act = ACT2FN[config.hidden_act]
+        # A Row-wise TP Linear layer: hidden_size -> rank
+        # self.q_proj0 = TensorParallelRowLinear(
+        #     config.hidden_size,
+        #     config.rank,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
+        # )
+        self.q_proj0 = nn.Linear(config.hidden_size, config.rank, bias=False)
+        # A Column-wise TP Linear layer: rank -> hidden_size
+        self.q_proj1 = TensorParallelColumnLinear(
+            config.rank,
             config.num_attention_heads * self.d_qk,
-            config.rank,
-            lr_act=config.hidden_act,
             pg=tp_pg,
             mode=tp_mode,
             bias=False,
             async_communication=tp_linear_async_communication,
-            tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+            # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+            # contiguous_chunks=qkv_contiguous_chunks,
         )
-        self.k_proj = CoLALinear(
-            self.d_model,
-            config.num_key_value_heads * self.d_qk,
+        # A Row-wise TP Linear layer: hidden_size -> rank
+        # self.k_proj0 = TensorParallelRowLinear(
+        #     config.hidden_size,
+        #     config.rank,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
+        # )
+        self.k_proj0 = nn.Linear(config.hidden_size, config.rank, bias=False)
+        # A Column-wise TP Linear layer: rank -> hidden_size
+        self.k_proj1 = TensorParallelColumnLinear(
             config.rank,
-            lr_act=config.hidden_act,
+            config.num_key_value_heads * self.d_qk,
             pg=tp_pg,
             mode=tp_mode,
             bias=False,
             async_communication=tp_linear_async_communication,
-            tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+            # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+            # contiguous_chunks=qkv_contiguous_chunks,
         )
-        self.v_proj = CoLALinear(
-            self.d_model,
-            config.num_key_value_heads * self.d_qk,
+        # A Row-wise TP Linear layer: hidden_size -> rank
+        # self.v_proj0 = TensorParallelRowLinear(
+        #     config.hidden_size,
+        #     config.rank,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
+        # )
+        self.v_proj0 = nn.Linear(config.hidden_size, config.rank, bias=False)
+        # A Column-wise TP Linear layer: rank -> hidden_size
+        self.v_proj1 = TensorParallelColumnLinear(
             config.rank,
-            lr_act=config.hidden_act,
+            config.num_key_value_heads * self.d_qk,
             pg=tp_pg,
             mode=tp_mode,
             bias=False,
             async_communication=tp_linear_async_communication,
-            tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+            # contiguous_chunks=qkv_contiguous_chunks,
+            # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
         )
         
          
@@ -502,17 +581,27 @@ class CausalSelfAttention(nn.Module, AttachableStore):
             dim=self.d_qk, base=config.rope_theta, interleaved=config.rope_interleaved
         )
 
-        self.o_proj = CoLALinear(
+        # A Row-wise TP Linear layer: hidden_size -> rank
+        self.o_proj0 = TensorParallelRowLinear(
             config.num_attention_heads * self.d_qk,
-            self.d_model,
             config.rank,
-            lr_act=config.hidden_act,
             pg=tp_pg,
             mode=tp_mode,
             bias=False,
-            async_communication=tp_linear_async_communication,
-            tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+            async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
         )
+        # A Column-wise TP Linear layer: rank -> hidden_size
+        # self.o_proj1 = TensorParallelColumnLinear(
+        #     config.rank,
+        #     self.d_model,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication,
+        #     # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+        #     # contiguous_chunks=qkv_contiguous_chunks,
+        # )
+        self.o_proj1 = nn.Linear(config.rank, self.d_model, bias=False)
 
         self.attention = CoreAttention(
             config,
@@ -537,9 +626,18 @@ class CausalSelfAttention(nn.Module, AttachableStore):
 
         torch.cuda.nvtx.range_push("qkv_proj")
         # Here concatenate hidden_states 3 times, not change the reduction dimension
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        lr_query_states = self.q_proj0(hidden_states)
+        lr_query_states = self.lr_act(lr_query_states)
+        query_states = self.q_proj1(lr_query_states)
+        
+        lr_key_states = self.k_proj0(hidden_states)
+        lr_key_states = self.lr_act(lr_key_states)
+        key_states = self.k_proj1(lr_key_states)
+        
+        lr_value_states = self.v_proj0(hidden_states)
+        lr_value_states = self.lr_act(lr_value_states)
+        value_states = self.v_proj1(lr_value_states)
+
         q_length, batch_size, _ = query_states.shape
         query_states = query_states.view(q_length, batch_size, self.n_local_q_heads, self.d_qk).permute(1, 0, 2, 3).contiguous()
         key_states = key_states.view(q_length, batch_size, self.n_local_kv_heads, self.d_qk).permute(1, 0, 2, 3).contiguous()   
@@ -801,7 +899,9 @@ class CausalSelfAttention(nn.Module, AttachableStore):
             attention_output.contiguous().view(batch_size, q_length, self.n_local_q_heads * self.d_v).transpose(0, 1)
         )
         torch.cuda.nvtx.range_push("o_proj")
-        output = self.o_proj(attention_output)
+        lr_attention_output = self.o_proj0(attention_output)
+        lr_attention_output = self.lr_act(lr_attention_output)
+        output = self.o_proj1(lr_attention_output)
         torch.cuda.nvtx.range_pop()
 
         return {"hidden_states": output, "sequence_mask": sequence_mask}
@@ -816,7 +916,11 @@ class LlamaDecoderLayer(nn.Module):
         layer_idx: int,
     ):
         super().__init__()
-        self.input_layernorm = TritonRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layer_idx = layer_idx
+        self.tp_pg = tp_pg
+        self.config = config
+        # self.input_layernorm = TritonRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # self.input_layernorm = TritonRMSNorm(config.hidden_size // tp_pg.size(), eps=config.rms_norm_eps)
         self.attn = CausalSelfAttention(
             config=config,
             parallel_config=parallel_config,
@@ -824,7 +928,8 @@ class LlamaDecoderLayer(nn.Module):
             layer_idx=layer_idx,
         )
 
-        self.post_attention_layernorm = TritonRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # self.post_attention_layernorm = TritonRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # self.post_attention_layernorm = TritonRMSNorm(config.hidden_size // tp_pg.size(), eps=config.rms_norm_eps)
         self.mlp = MLP(config=config, parallel_config=parallel_config, tp_pg=tp_pg)
 
         self.recompute_layer = parallel_config.recompute_layer
@@ -834,10 +939,13 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: Union[torch.Tensor, TensorPointer],
         sequence_mask: Union[torch.Tensor, TensorPointer],
     ) -> List[Union[torch.Tensor, TensorPointer]]:
+        # if self.layer_idx == 0:
+        #     hidden_states = self.split_hidden_states(hidden_states)
+        
         residual = hidden_states
-        torch.cuda.nvtx.range_push("attn_layernorm")
-        hidden_states = self.input_layernorm(hidden_states)
-        torch.cuda.nvtx.range_pop()
+        # torch.cuda.nvtx.range_push("attn_layernorm")
+        # hidden_states = self.input_layernorm(hidden_states)
+        # torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("attn")
         output = self.attn(hidden_states=hidden_states, sequence_mask=sequence_mask)
@@ -846,15 +954,17 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = hidden_states + residual
 
         residual = hidden_states
-        torch.cuda.nvtx.range_push("post_attention_layernorm")
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        torch.cuda.nvtx.range_pop()
+        # torch.cuda.nvtx.range_push("post_attention_layernorm")
+        # hidden_states = self.post_attention_layernorm(hidden_states)
+        # torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("mlp")
         hidden_states = self.mlp(hidden_states=hidden_states)["hidden_states"]
         torch.cuda.nvtx.range_pop()
         hidden_states = hidden_states + residual
 
+        # if self.layer_idx == self.config.num_hidden_layers - 1:
+        #     hidden_states = self.all_gather_last_dim(hidden_states)
         return hidden_states, output["sequence_mask"]
 
     def _checkpointed_forward(
@@ -879,7 +989,21 @@ class LlamaDecoderLayer(nn.Module):
             "hidden_states": hidden_states,
             "sequence_mask": sequence_mask,
         }
-
+    
+    # def split_hidden_states(self, hidden_states):
+    #     tp_rank = dist.get_rank(self.tp_pg)
+    #     tp_size = self.tp_pg.size()
+    #     d = hidden_states.shape[-1]
+    #     d_local = d // tp_size
+    #     start = tp_rank * d_local
+    #     end = (tp_rank + 1) * d_local
+    #     return hidden_states[..., start:end].contiguous()
+    
+    # def all_gather_last_dim(self, hidden_states):
+    #     tp_size = self.tp_pg.size()
+    #     gather_list = [torch.empty_like(hidden_states) for _ in range(tp_size)]
+    #     dist.all_gather(gather_list, hidden_states.contiguous(), group=self.tp_pg)
+    #     return torch.cat(gather_list, dim=-1)
 
 class Embedding(nn.Module, AttachableStore):
     def __init__(self, tp_pg: dist.ProcessGroup, config: ColaLlamaConfig, parallel_config: Optional[ParallelismArgs]):
