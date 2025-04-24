@@ -505,6 +505,13 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         #     bias=False,
         #     async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
         # )
+        # self.q_proj0 = TiedLinear(
+        #     config.hidden_size, 
+        #     config.rank, 
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        # )
         self.q_proj0 = nn.Linear(config.hidden_size, config.rank, bias=False)
         # A Column-wise TP Linear layer: rank -> hidden_size
         self.q_proj1 = TensorParallelColumnLinear(
@@ -526,6 +533,7 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         #     bias=False,
         #     async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
         # )
+        # self.k_proj0 = nn.Linear(config.hidden_size, config.rank, bias=False)
         self.k_proj0 = nn.Linear(config.hidden_size, config.rank, bias=False)
         # A Column-wise TP Linear layer: rank -> hidden_size
         self.k_proj1 = TensorParallelColumnLinear(
@@ -1307,11 +1315,17 @@ class ColaLlamaForTraining(NanotronModel):
 
             if param.is_tied:
                 tied_info = param.get_tied_info()
+                log_rank(f"tied_info_name: {tied_info.name}", logger=logger, level=logging.INFO, rank=0)
+                # print(f"param: {param}")
                 full_param_name = tied_info.get_full_name_from_module_id_to_prefix(
                     module_id_to_prefix=module_id_to_prefix
                 )
             else:
                 full_param_name = f"{module_name}.{param_name}"
+            
+            # log sharded parameter name
+            if param.is_sharded:
+                log_rank(f"sharded_param_name: {full_param_name}", logger=logger, level=logging.INFO, rank=0)
 
             if full_param_name in initialized_parameters:
                 # Already initialized
