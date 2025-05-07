@@ -220,16 +220,38 @@ class MLP(nn.Module):
             config.intermediate_size,  # shape of gate_linear
             config.intermediate_size,  # shape of up_linear
         )
-        self.gate_up_proj = TensorParallelColumnLinear(
+        # self.gate_up_proj = TensorParallelColumnLinear(
+        #     config.hidden_size,
+        #     2 * config.intermediate_size,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication,
+        #     contiguous_chunks=gate_up_contiguous_chunks,
+        #     tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+        # )
+        self.gate_proj = TensorParallelColumnLinear(
             config.hidden_size,
-            2 * config.intermediate_size,
+            config.intermediate_size,
             pg=tp_pg,
             mode=tp_mode,
             bias=False,
             async_communication=tp_linear_async_communication,
-            contiguous_chunks=gate_up_contiguous_chunks,
+            # contiguous_chunks=gate_up_contiguous_chunks,
             tp_recompute_allgather=parallel_config.tp_recompute_allgather,
         )
+        self.up_proj = TensorParallelColumnLinear(
+            config.hidden_size,
+            config.intermediate_size,
+            pg=tp_pg,
+            mode=tp_mode,
+            bias=False,
+            async_communication=tp_linear_async_communication,
+            # contiguous_chunks=gate_up_contiguous_chunks,
+            tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+        )
+        self.lr_act = ACT2FN[config.hidden_act]
+
         self.down_proj = TensorParallelRowLinear(
             config.intermediate_size,
             config.hidden_size,
@@ -241,8 +263,12 @@ class MLP(nn.Module):
         self.split_silu_mul = GLUActivation(config.hidden_act)
 
     def forward(self, hidden_states):  # [seq_length, batch_size, hidden_dim]
-        merged_states = self.gate_up_proj(hidden_states)
-        hidden_states = self.down_proj(self.split_silu_mul(merged_states))
+        # merged_states = self.gate_up_proj(hidden_states)
+        # hidden_states = self.down_proj(self.split_silu_mul(merged_states))
+        gate_states = self.gate_proj(hidden_states)
+        up_states = self.up_proj(hidden_states)
+        hidden_states = self.lr_act(gate_states) * up_states
+        hidden_states = self.down_proj(hidden_states)
         return {"hidden_states": hidden_states}
 
 
@@ -381,14 +407,44 @@ class CausalSelfAttention(nn.Module, AttachableStore):
             config.num_key_value_heads * self.d_qk,  # shape of k
             config.num_key_value_heads * self.d_qk,  # shape of v
         )
-        self.qkv_proj = TensorParallelColumnLinear(
+        # self.qkv_proj = TensorParallelColumnLinear(
+        #     self.d_model,
+        #     config.num_attention_heads * self.d_qk + 2 * config.num_key_value_heads * self.d_qk,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication,
+        #     contiguous_chunks=qkv_contiguous_chunks,
+        #     tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+        # )
+        self.q_proj = TensorParallelColumnLinear(
             self.d_model,
-            config.num_attention_heads * self.d_qk + 2 * config.num_key_value_heads * self.d_qk,
+            config.num_attention_heads * self.d_qk,
             pg=tp_pg,
             mode=tp_mode,
             bias=False,
             async_communication=tp_linear_async_communication,
-            contiguous_chunks=qkv_contiguous_chunks,
+            # contiguous_chunks=qkv_contiguous_chunks,
+            tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+        )
+        self.k_proj = TensorParallelColumnLinear(
+            self.d_model,
+            config.num_key_value_heads * self.d_qk,
+            pg=tp_pg,
+            mode=tp_mode,
+            bias=False,
+            async_communication=tp_linear_async_communication,
+            # contiguous_chunks=qkv_contiguous_chunks,
+            tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+        )
+        self.v_proj = TensorParallelColumnLinear(
+            self.d_model,
+            config.num_key_value_heads * self.d_qk,
+            pg=tp_pg,
+            mode=tp_mode,
+            bias=False,
+            async_communication=tp_linear_async_communication,
+            # contiguous_chunks=qkv_contiguous_chunks,
             tp_recompute_allgather=parallel_config.tp_recompute_allgather,
         )
         # TODO(kunhao): We want to have only one version per device and not one version per layer.
@@ -441,10 +497,13 @@ class CausalSelfAttention(nn.Module, AttachableStore):
             flash_attn_with_kvcache,
         )
         torch.cuda.nvtx.range_push("qkv_proj")
-        qkv_states = self.qkv_proj(
-            hidden_states
-        )  # [seq_length, batch_size, n_local_q_heads * d_qk + 2 * n_local_kv_heads * d_qk]
-        q_length, batch_size, _ = qkv_states.shape
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+        # qkv_states = self.qkv_proj(
+        #     hidden_states
+        # )  # [seq_length, batch_size, n_local_q_heads * d_qk + 2 * n_local_kv_heads * d_qk]
+        q_length, batch_size, _ = query_states.shape
         torch.cuda.nvtx.range_pop()
         if self.is_gqa:
             query_states, key_states, value_states = torch.split(
@@ -468,11 +527,14 @@ class CausalSelfAttention(nn.Module, AttachableStore):
             )
         else:
             torch.cuda.nvtx.range_push("qkv_states reshape")
-            query_states, key_states, value_states = (
-                qkv_states.view(q_length, batch_size, 3, self.n_local_q_heads, self.d_qk)
-                .permute(2, 1, 0, 3, 4)
-                .contiguous()
-            )  # [3, batch_size, seq_length, n_local_q_heads, d_qk]
+            query_states = query_states.view(q_length, batch_size, self.n_local_q_heads, self.d_qk).permute(1, 0, 2, 3).contiguous()
+            key_states = key_states.view(q_length, batch_size, self.n_local_kv_heads, self.d_qk).permute(1, 0, 2, 3).contiguous()
+            value_states = value_states.view(q_length, batch_size, self.n_local_kv_heads, self.d_qk).permute(1, 0, 2, 3).contiguous()
+            # query_states, key_states, value_states = (
+            #     qkv_states.view(q_length, batch_size, 3, self.n_local_q_heads, self.d_qk)
+            #     .permute(2, 1, 0, 3, 4)
+            #     .contiguous()
+            # )  # [3, batch_size, seq_length, n_local_q_heads, d_qk]
             torch.cuda.nvtx.range_pop()
 
         store = self.get_local_store()
