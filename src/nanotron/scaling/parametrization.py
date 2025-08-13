@@ -4,11 +4,12 @@ from enum import Enum, auto
 from typing import Dict
 
 from nanotron.config import ModelArgs
-from nanotron.nn.layer_norm import TritonRMSNorm
+from nanotron.nn.layer_norm import TritonRMSNorm, DelayedTritonRMSNorm
 from nanotron.parallel.tensor_parallel.nn import (
     TensorParallelColumnLinear,
     TensorParallelEmbedding,
     TensorParallelRowLinear,
+    TiedLinear,
 )
 from torch import nn
 from torch.nn import init
@@ -41,6 +42,8 @@ class StandardParametrizator(Parametrizator):
             TritonRMSNorm: self._parametrize_layer_norm,
             TensorParallelEmbedding: self._parametrize_embedding,
             Linear: self._parametrize_nn_linear,
+            TiedLinear: self._parametrize_tied_linear,
+            DelayedTritonRMSNorm: self._parametrize_layer_norm,
         }
 
         self.std = config.init_method.std
@@ -79,6 +82,14 @@ class StandardParametrizator(Parametrizator):
             init.normal_(module.weight, mean=0.0, std=self.std)
     
     def _parametrize_nn_linear(self, param_name: str, module: nn.Module):
+        assert param_name in ["weight", "bias"]
+
+        if "weight" == param_name:
+            init.normal_(module.weight, mean=0.0, std=self.std)
+        elif "bias" == param_name:
+            module.bias.zero_()
+    
+    def _parametrize_tied_linear(self, param_name: str, module: nn.Module):
         assert param_name in ["weight", "bias"]
 
         if "weight" == param_name:

@@ -158,7 +158,7 @@ class TensorParallelRowLinear(nn.Linear):
                 )
             setattr(self, name, new_param)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, rstd: Optional[torch.Tensor] = None) -> torch.Tensor:
         return row_linear(
             input=x,
             weight=self.weight,
@@ -166,6 +166,7 @@ class TensorParallelRowLinear(nn.Linear):
             group=self.pg,
             tp_mode=self.mode,
             async_communication=self.async_communication,
+            rstd=rstd,
         )
 
     def extra_repr(self) -> str:

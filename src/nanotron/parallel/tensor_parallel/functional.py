@@ -23,6 +23,7 @@ from nanotron.parallel.tensor_parallel.distributed_differentiable_primitives imp
     differentiable_all_reduce_sum,
     differentiable_identity,
     differentiable_reduce_scatter_sum,
+    differentiable_coalesced_all_reduce_sum,
 )
 from nanotron.parallel.tensor_parallel.enum import TensorParallelLinearMode
 from nanotron.parallel.utils import MemoryBuffer, assert_cuda_max_connections_set_to_1
@@ -588,6 +589,7 @@ def row_linear(
     group: dist.ProcessGroup,
     tp_mode: TensorParallelLinearMode,
     async_communication: bool,
+    rstd: Optional[torch.Tensor] = None,
 ):
     if async_communication:
         return _RowLinearAsyncCommunication.apply(input, weight, bias, group, tp_mode)
@@ -595,7 +597,14 @@ def row_linear(
     out = F.linear(input, weight, bias)
 
     if tp_mode is TensorParallelLinearMode.ALL_REDUCE:
-        out = differentiable_all_reduce_sum(out, group=group)
+        if rstd is not None:
+            [out, rstd_new] =  differentiable_coalesced_all_reduce_sum([out, rstd], group=group)
+            # scale_correction = rstd / rstd_new
+            # Not require rstd gradient
+            scale_correction = rstd.detach() / rstd_new.detach()
+            out.mul_(scale_correction)
+        else:
+            out = differentiable_all_reduce_sum(out, group=group)
     elif tp_mode is TensorParallelLinearMode.REDUCE_SCATTER:
         out = differentiable_reduce_scatter_sum(out, group=group)
     else:

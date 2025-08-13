@@ -28,7 +28,7 @@ from nanotron.generation.generate_store import AttachableStore
 from nanotron.logging import log_rank
 from nanotron.models import NanotronModel
 from nanotron.nn.activations import ACT2FN
-from nanotron.nn.layer_norm import TritonRMSNorm
+from nanotron.nn.layer_norm import TritonRMSNorm, DelayedTritonRMSNorm
 from nanotron.parallel import ParallelContext
 from nanotron.parallel.parameters import NanotronParameter
 from nanotron.parallel.pipeline_parallel.block import PipelineBlock, TensorPointer
@@ -338,10 +338,10 @@ class MLP(nn.Module):
                 # contiguous_chunks=gate_up_contiguous_chunks,
                 # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
             )
-    def forward(self, hidden_states):  # [seq_length, batch_size, hidden_dim]
+    def forward(self, hidden_states, rstd=None):  # [seq_length, batch_size, hidden_dim]
         # [seq_length, batch_size, rank]
-        lr_gate_states = self.gate_proj0(hidden_states)
-        lr_up_states = self.up_proj0(hidden_states)
+        lr_gate_states = self.gate_proj0(hidden_states, rstd)
+        lr_up_states = self.up_proj0(hidden_states, rstd)
         # [seq_length, batch_size, rank]
         lr_gate_states = self.lr_act(lr_gate_states)
         lr_up_states = self.lr_act(lr_up_states)
@@ -623,6 +623,7 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         self,
         hidden_states,  # [seq_length, batch_size, hidden_size]
         sequence_mask,  # [batch_size, seq_length]
+        rstd=None,
     ):
         from flash_attn import bert_padding
         from flash_attn.flash_attn_interface import (
@@ -632,15 +633,15 @@ class CausalSelfAttention(nn.Module, AttachableStore):
 
         torch.cuda.nvtx.range_push("qkv_proj")
         # Here concatenate hidden_states 3 times, not change the reduction dimension
-        lr_query_states = self.q_proj0(hidden_states)
+        lr_query_states = self.q_proj0(hidden_states, rstd)
         lr_query_states = self.lr_act(lr_query_states)
         query_states = self.q_proj1(lr_query_states)
         
-        lr_key_states = self.k_proj0(hidden_states)
+        lr_key_states = self.k_proj0(hidden_states, rstd)
         lr_key_states = self.lr_act(lr_key_states)
         key_states = self.k_proj1(lr_key_states)
         
-        lr_value_states = self.v_proj0(hidden_states)
+        lr_value_states = self.v_proj0(hidden_states, rstd)
         lr_value_states = self.lr_act(lr_value_states)
         value_states = self.v_proj1(lr_value_states)
 
@@ -926,7 +927,7 @@ class LlamaDecoderLayer(nn.Module):
         self.tp_pg = tp_pg
         self.config = config
         # self.input_layernorm = TritonRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.input_layernorm = TritonRMSNorm(config.hidden_size // tp_pg.size(), eps=config.rms_norm_eps)
+        self.input_layernorm = DelayedTritonRMSNorm(config.hidden_size // tp_pg.size(), eps=config.rms_norm_eps)
         self.attn = CausalSelfAttention(
             config=config,
             parallel_config=parallel_config,
@@ -935,7 +936,7 @@ class LlamaDecoderLayer(nn.Module):
         )
 
         # self.post_attention_layernorm = TritonRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = TritonRMSNorm(config.hidden_size // tp_pg.size(), eps=config.rms_norm_eps)
+        self.post_attention_layernorm = DelayedTritonRMSNorm(config.hidden_size // tp_pg.size(), eps=config.rms_norm_eps)
         self.mlp = MLP(config=config, parallel_config=parallel_config, tp_pg=tp_pg, layer_idx=layer_idx)
 
         self.recompute_layer = parallel_config.recompute_layer
@@ -948,22 +949,22 @@ class LlamaDecoderLayer(nn.Module):
         
         residual = hidden_states
         # torch.cuda.nvtx.range_push("attn_layernorm")
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, rstd = self.input_layernorm(hidden_states)
         # torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("attn")
-        output = self.attn(hidden_states=hidden_states, sequence_mask=sequence_mask)
+        output = self.attn(hidden_states=hidden_states, sequence_mask=sequence_mask, rstd=rstd)
         torch.cuda.nvtx.range_pop()
         hidden_states = output["hidden_states"]
         hidden_states = hidden_states + residual
 
         residual = hidden_states
         # torch.cuda.nvtx.range_push("post_attention_layernorm")
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, rstd = self.post_attention_layernorm(hidden_states)
         # torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("mlp")
-        hidden_states = self.mlp(hidden_states=hidden_states)["hidden_states"]
+        hidden_states = self.mlp(hidden_states=hidden_states, rstd=rstd)["hidden_states"]
         torch.cuda.nvtx.range_pop()
         # hidden_states = hidden_states + residual
 

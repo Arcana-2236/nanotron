@@ -50,6 +50,21 @@ class DifferentiableAllReduceSum(torch.autograd.Function):
     def backward(ctx, grad_output):
         return grad_output, None
 
+class DifferentiableCoalescedAllReduceSum(torch.autograd.Function):
+    """Coalesced All-reduce in a differentiable fashion"""
+
+    @staticmethod
+    def forward(ctx, tensor, group: Optional[ProcessGroup]):
+        if group.size() == 1:
+            return tensor
+
+        dist.all_reduce_coalesced(tensor, op=dist.ReduceOp.SUM, group=group)
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None
+
 
 class DifferentiableAllGather(torch.autograd.Function):
     """All gather in a differentiable fashion"""
@@ -144,3 +159,7 @@ def differentiable_all_gather(tensor, group: Optional[ProcessGroup] = None):
 
 def differentiable_reduce_scatter_sum(tensor, group: Optional[ProcessGroup] = None):
     return DifferentiableReduceScatterSum.apply(tensor, group)
+
+
+def differentiable_coalesced_all_reduce_sum(tensor, group: Optional[ProcessGroup] = None):
+    return DifferentiableCoalescedAllReduceSum.apply(tensor, group)
