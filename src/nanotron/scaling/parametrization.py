@@ -10,6 +10,7 @@ from nanotron.parallel.tensor_parallel.nn import (
     TensorParallelEmbedding,
     TensorParallelRowLinear,
     TiedLinear,
+    BatchedTensorParallelColumnLinear,
 )
 from torch import nn
 from torch.nn import init
@@ -44,6 +45,7 @@ class StandardParametrizator(Parametrizator):
             Linear: self._parametrize_nn_linear,
             TiedLinear: self._parametrize_tied_linear,
             DelayedTritonRMSNorm: self._parametrize_layer_norm,
+            BatchedTensorParallelColumnLinear: self._parametrize_column_linear,
         }
 
         self.std = config.init_method.std

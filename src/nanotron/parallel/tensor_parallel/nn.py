@@ -14,6 +14,7 @@
 
 from typing import Optional, Tuple
 
+import math
 import torch
 from torch import nn
 
@@ -35,6 +36,7 @@ from nanotron.parallel.tensor_parallel.enum import TensorParallelLinearMode
 from nanotron.parallel.tensor_parallel.functional import (
     column_linear,
     row_linear,
+    batched_column_linear,
 )
 from nanotron.parallel.tied_parameters import create_tied_parameter
 
@@ -301,3 +303,70 @@ class TensorParallelEmbedding(nn.Embedding):
 
     def extra_repr(self) -> str:
         return f"tp_rank={dist.get_rank(self.pg)}, {super().extra_repr()}, unsharded_num_embeddings={self.original_num_embeddings}"
+
+
+class BatchedTensorParallelColumnLinear(nn.Module):
+    def __init__(
+        self, 
+        in_features, 
+        out_features, 
+        gemm_num,
+        pg: dist.ProcessGroup,
+        mode: TensorParallelLinearMode,
+        bias=True,
+        device=None,
+        dtype=None,
+        async_communication: bool = False,
+        contiguous_chunks: Optional[Tuple[int, ...]] = None,
+        tp_recompute_allgather: bool = True,
+    ):
+        super().__init__()
+        self.pg = pg
+        self.world_size = pg.size()
+
+        assert out_features % self.world_size == 0
+
+        self.in_features = in_features
+        self.out_features_local = out_features // self.world_size
+        self.tp_recompute_allgather = tp_recompute_allgather
+        self.gemm_num = gemm_num
+
+        self.weight = nn.Parameter(torch.empty(self.gemm_num, self.out_features_local, self.in_features, device=device, dtype=dtype))
+        self.bias = nn.Parameter(torch.empty(self.gemm_num, self.out_features_local, device=device, dtype=dtype)) if bias else None
+        # self._init_parameters()
+
+        self.mode = mode
+        self.async_communication = async_communication
+
+        if contiguous_chunks is not None:
+            assert (
+                sum(contiguous_chunks) == out_features
+            ), f"Sum of contiguous chunks ({sum(contiguous_chunks)}) must equal to out_features ({out_features})"
+        split_config = SplitConfig(split_dim=0, contiguous_chunks=contiguous_chunks)
+
+        mark_all_parameters_in_module_as_sharded(
+            self,
+            pg=self.pg,
+            split_config=split_config,
+        )
+
+    # def _init_parameters(self):
+    #     nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+    #     if self.bias is not None:
+    #         bound = 1 / math.sqrt(self.in_features)
+    #         nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return batched_column_linear(
+            gemm_num=self.gemm_num,
+            input=x,
+            weight=self.weight,
+            bias=self.bias,
+            group=self.pg,
+            tp_mode=self.mode,
+            async_communication=self.async_communication,
+            tp_recompute_allgather=self.tp_recompute_allgather,
+        )
+
+    def extra_repr(self) -> str:
+        return f"tp_rank={dist.get_rank(self.pg)}, {super().extra_repr()}, unsharded_out_features={self.out_features * self.world_size}"

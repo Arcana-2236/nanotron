@@ -40,6 +40,7 @@ from nanotron.parallel.tensor_parallel.nn import (
     TensorParallelLinearMode,
     TensorParallelRowLinear,
     TiedLinear,
+    BatchedTensorParallelColumnLinear,
 )
 from nanotron.random import RandomStates
 from nanotron.scaling.parametrization import SpectralMupParametrizator, StandardParametrizator
@@ -273,48 +274,70 @@ class MLP(nn.Module):
         )
         self.lr_act = ACT2FN[config.hidden_act]
         # Now only support ALL_REDUCE mode
-        # A Row-wise TP Linear layer: hidden_size -> rank
-        self.gate_proj0 = TensorParallelRowLinear(
+        
+        # Grouping gate down_proj and up down_proj
+        self.gate_up_proj0 = TensorParallelRowLinear(
             config.hidden_size,
-            config.mlp_rank,
+            2 * config.mlp_rank,
             pg=tp_pg,
             mode=tp_mode,
             bias=False,
             async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
         )
+
+        self.gate_up_proj1 = BatchedTensorParallelColumnLinear(
+            config.mlp_rank,
+            config.intermediate_size,
+            2,
+            pg=tp_pg,
+            mode=tp_mode,
+            bias=False,
+            async_communication=tp_linear_async_communication,
+        )
+
+
+        # A Row-wise TP Linear layer: hidden_size -> rank
+        # self.gate_proj0 = TensorParallelRowLinear(
+        #     config.hidden_size,
+        #     config.mlp_rank,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
+        # )
         # self.gate_proj0 = nn.Linear(config.hidden_size, config.rank, bias=False)
         # A Column-wise TP Linear layer: rank -> intermediate_size
-        self.gate_proj1 = TensorParallelColumnLinear(
-            config.mlp_rank,
-            config.intermediate_size,
-            pg=tp_pg,
-            mode=tp_mode,
-            bias=False,
-            async_communication=tp_linear_async_communication,
-            # contiguous_chunks=gate_up_contiguous_chunks,
-            # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
-        )
+        # self.gate_proj1 = TensorParallelColumnLinear(
+        #     config.mlp_rank,
+        #     config.intermediate_size,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication,
+        #     # contiguous_chunks=gate_up_contiguous_chunks,
+        #     # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+        # )
         # A Row-wise TP Linear layer: hidden_size -> rank
-        self.up_proj0 = TensorParallelRowLinear(
-            config.hidden_size,
-            config.mlp_rank,
-            pg=tp_pg,
-            mode=tp_mode,
-            bias=False,
-            async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
-        )
+        # self.up_proj0 = TensorParallelRowLinear(
+        #     config.hidden_size,
+        #     config.mlp_rank,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
+        # )
         # self.up_proj0 = nn.Linear(config.hidden_size, config.rank, bias=False)
         # A Column-wise TP Linear layer: rank -> intermediate_size
-        self.up_proj1 = TensorParallelColumnLinear(
-            config.mlp_rank,
-            config.intermediate_size,
-            pg=tp_pg,
-            mode=tp_mode,
-            bias=False,
-            async_communication=tp_linear_async_communication,
-            # contiguous_chunks=gate_up_contiguous_chunks,
-            # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
-        )
+        # self.up_proj1 = TensorParallelColumnLinear(
+        #     config.mlp_rank,
+        #     config.intermediate_size,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication,
+        #     # contiguous_chunks=gate_up_contiguous_chunks,
+        #     # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+        # )
         # A Row-wise TP Linear layer: intermediate_size -> rank
         self.down_proj0 = TensorParallelRowLinear(
             config.intermediate_size,
@@ -340,14 +363,36 @@ class MLP(nn.Module):
             )
     def forward(self, hidden_states, rstd=None):  # [seq_length, batch_size, hidden_dim]
         # [seq_length, batch_size, rank]
-        lr_gate_states = self.gate_proj0(hidden_states, rstd)
-        lr_up_states = self.up_proj0(hidden_states, rstd)
+        # lr_gate_states = self.gate_proj0(hidden_states, rstd)
+        # lr_up_states = self.up_proj0(hidden_states, rstd)
+
+        # [seq_length, batch_size, 2 * rank]
+        # print("1. contiguous: ", hidden_states.is_contiguous(), hidden_states.shape, hidden_states.stride())
+        merged_states = self.gate_up_proj0(hidden_states, rstd)
+        # print("2. contiguous: ", merged_states.is_contiguous(), merged_states.shape, merged_states.stride())
+        merged_states = self.lr_act(merged_states)
+        # print("merged_states 1.shape", merged_states.shape)
+        # [seq_length, batch_size, 2, rank]
+        # print("3. contiguous: ", merged_states.is_contiguous(), merged_states.shape, merged_states.stride())
+        merged_states = merged_states.unflatten(-1, (2, -1))
+        # print("merged_states 2.shape", merged_states.shape)
+        # [seq_length, batch_size, 2, intermediate_size // TP]
+        # print("4. contiguous: ", merged_states.is_contiguous(), merged_states.shape, merged_states.stride())
+        merged_states = self.gate_up_proj1(merged_states)
+        # print("merged_states 3.shape", merged_states.shape)
+        # 2 x [seq_length, batch_size, intermediate_size // TP]
+        # print("5. contiguous: ", merged_states.is_contiguous(), merged_states.shape, merged_states.stride())
+        gate_states, up_states = merged_states.unbind(dim=0)
+        # [seq_length, batch_size, 2 * rank]
+        # lr_up_states = self.gate_up_proj0(hidden_states, rstd)
+
+        # [seq_length, batch_size, 2 * rank]
         # [seq_length, batch_size, rank]
-        lr_gate_states = self.lr_act(lr_gate_states)
-        lr_up_states = self.lr_act(lr_up_states)
+        # lr_gate_states = self.lr_act(lr_gate_states)
+        # lr_up_states = self.lr_act(lr_up_states)
         # [seq_length, batch_size, intermediate_size/TP]
-        gate_states = self.gate_proj1(lr_gate_states)
-        up_states = self.up_proj1(lr_up_states)
+        # gate_states = self.gate_proj1(lr_gate_states)
+        # up_states = self.up_proj1(lr_up_states)
         # [seq_length, batch_size, intermediate_size/TP]
         hidden_states = gate_states * up_states
 
@@ -508,63 +553,86 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         # )
 
         # A Row-wise TP Linear layer: hidden_size -> rank
-        self.q_proj0 = TensorParallelRowLinear(
+        # self.q_proj0 = TensorParallelRowLinear(
+        #     config.hidden_size,
+        #     config.attn_rank,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
+        # )
+        # self.k_proj0 = TensorParallelRowLinear(
+        #     config.hidden_size,
+        #     config.attn_rank,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
+        # )
+        # self.v_proj0 = TensorParallelRowLinear(
+        #     config.hidden_size,
+        #     config.attn_rank,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
+        # )
+        
+        # Grouping qkv first projection
+        self.qkv_proj0 = TensorParallelRowLinear(
             config.hidden_size,
-            config.attn_rank,
+            3 * config.attn_rank,
             pg=tp_pg,
             mode=tp_mode,
             bias=False,
             async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
         )
-        self.k_proj0 = TensorParallelRowLinear(
-            config.hidden_size,
-            config.attn_rank,
-            pg=tp_pg,
-            mode=tp_mode,
-            bias=False,
-            async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
-        )
-        self.v_proj0 = TensorParallelRowLinear(
-            config.hidden_size,
-            config.attn_rank,
-            pg=tp_pg,
-            mode=tp_mode,
-            bias=False,
-            async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
-        )
-        # A Column-wise TP Linear layer: rank -> hidden_size
-        self.q_proj1 = TensorParallelColumnLinear(
-            config.attn_rank,
-            config.num_attention_heads * self.d_qk,
-            pg=tp_pg,
-            mode=tp_mode,
-            bias=False,
-            async_communication=tp_linear_async_communication,
-            # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
-            # contiguous_chunks=qkv_contiguous_chunks,
-        )
-        # A Column-wise TP Linear layer: rank -> hidden_size
-        self.k_proj1 = TensorParallelColumnLinear(
+
+        # Not using GQA, thus we can batch 3 gemms at once
+        # If using GQA, we can simply group KV GEMM, or simply not using groupping
+        self.qkv_proj1 = BatchedTensorParallelColumnLinear(
             config.attn_rank,
             config.num_key_value_heads * self.d_qk,
+            3,
             pg=tp_pg,
             mode=tp_mode,
             bias=False,
             async_communication=tp_linear_async_communication,
-            # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
-            # contiguous_chunks=qkv_contiguous_chunks,
         )
-        # A Column-wise TP Linear layer: rank -> hidden_size
-        self.v_proj1 = TensorParallelColumnLinear(
-            config.attn_rank,
-            config.num_key_value_heads * self.d_qk,
-            pg=tp_pg,
-            mode=tp_mode,
-            bias=False,
-            async_communication=tp_linear_async_communication,
-            # contiguous_chunks=qkv_contiguous_chunks,
-            # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
-        )
+
+        # # A Column-wise TP Linear layer: rank -> hidden_size
+        # self.q_proj1 = TensorParallelColumnLinear(
+        #     config.attn_rank,
+        #     config.num_attention_heads * self.d_qk,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication,
+        #     # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+        #     # contiguous_chunks=qkv_contiguous_chunks,
+        # )
+        # # A Column-wise TP Linear layer: rank -> hidden_size
+        # self.k_proj1 = TensorParallelColumnLinear(
+        #     config.attn_rank,
+        #     config.num_key_value_heads * self.d_qk,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication,
+        #     # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+        #     # contiguous_chunks=qkv_contiguous_chunks,
+        # )
+        # # A Column-wise TP Linear layer: rank -> hidden_size
+        # self.v_proj1 = TensorParallelColumnLinear(
+        #     config.attn_rank,
+        #     config.num_key_value_heads * self.d_qk,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication,
+        #     # contiguous_chunks=qkv_contiguous_chunks,
+        #     # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+        # )
         
          
         # TODO(kunhao): We want to have only one version per device and not one version per layer.
@@ -632,18 +700,31 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         )
 
         torch.cuda.nvtx.range_push("qkv_proj")
+        # [seq_length, batch_size, 3 * rank]
+        qkv_states = self.qkv_proj0(hidden_states, rstd)
+        qkv_states = self.lr_act(qkv_states)
+        qkv_states = qkv_states.unflatten(-1, (3, -1))
+        qkv_states = self.qkv_proj1(qkv_states)
+        query_states, key_states, value_states = qkv_states.unbind(dim=0)
+
+        # [seq_length, batch_size, 3, rank]
+        # qkv_states = qkv_states.unflatten(-1, (3, -1))
+        # print("qkv_states.shape", qkv_states.shape)
+
+        # lr_query_states, lr_key_states, lr_value_states = torch.split(qkv_states, qkv_states.shape[-1] // 3, dim=-1)
+
         # Here concatenate hidden_states 3 times, not change the reduction dimension
-        lr_query_states = self.q_proj0(hidden_states, rstd)
-        lr_query_states = self.lr_act(lr_query_states)
-        query_states = self.q_proj1(lr_query_states)
+        # lr_query_states = self.q_proj0(hidden_states, rstd)
+        # lr_query_states = self.lr_act(lr_query_states)
+        # query_states = self.q_proj1(lr_query_states)
         
-        lr_key_states = self.k_proj0(hidden_states, rstd)
-        lr_key_states = self.lr_act(lr_key_states)
-        key_states = self.k_proj1(lr_key_states)
+        # lr_key_states = self.k_proj0(hidden_states, rstd)
+        # lr_key_states = self.lr_act(lr_key_states)
+        # key_states = self.k_proj1(lr_key_states)
         
-        lr_value_states = self.v_proj0(hidden_states, rstd)
-        lr_value_states = self.lr_act(lr_value_states)
-        value_states = self.v_proj1(lr_value_states)
+        # lr_value_states = self.v_proj0(hidden_states, rstd)
+        # lr_value_states = self.lr_act(lr_value_states)
+        # value_states = self.v_proj1(lr_value_states)
 
         q_length, batch_size, _ = query_states.shape
         query_states = query_states.view(q_length, batch_size, self.n_local_q_heads, self.d_qk).permute(1, 0, 2, 3).contiguous()

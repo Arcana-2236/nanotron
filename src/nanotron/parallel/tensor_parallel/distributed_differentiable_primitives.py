@@ -43,6 +43,15 @@ class DifferentiableAllReduceSum(torch.autograd.Function):
         if group.size() == 1:
             return tensor
 
+        if not tensor.is_contiguous():
+            # torch.cuda.nvtx.range_push("contiguous")
+            tensor = tensor.permute(2, 0, 1, 3)
+            # print("tensor 0.stride", tensor.stride())
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
+            tensor = tensor.permute(1, 2, 0, 3)
+            # print("tensor 1.stride", tensor.stride())
+            # torch.cuda.nvtx.range_pop()
+            return tensor
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
         return tensor
 

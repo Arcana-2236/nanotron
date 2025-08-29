@@ -611,3 +611,40 @@ def row_linear(
         raise ValueError(f"Got unexpected mode: {tp_mode}.")
 
     return out
+
+
+def batched_column_linear(
+    gemm_num: int,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    group: dist.ProcessGroup,
+    tp_mode: TensorParallelLinearMode,
+    async_communication: bool,
+    tp_recompute_allgather: bool = True,
+):
+    # Expected input shape: [seq_length, batch_size, gemm_num, d]
+    # gemm_num = 2 in MLP first layer, gemm_num = 3 in attention qkv projection
+    if async_communication:
+        raise NotImplementedError("Currently Async communication is not supported for batched column linear.")
+    
+    if tp_mode is TensorParallelLinearMode.ALL_REDUCE:
+        # input.register_hook(lambda g: g.permute(1, 2, 0, 3))
+        input = differentiable_identity(input, group=group)
+        # print("input.shape", input.shape)
+        # print("weight.shape", weight.shape)
+        # input.register_hook(lambda g: print("input grad to all_reduce:", g.is_contiguous(), g.shape, g.stride()))
+        # weight.register_hook(lambda g: print("weight grad to all_reduce:", g.is_contiguous(), g.shape, g.stride()))
+        # input.register_hook(lambda g: g.contiguous())   # [c s b r] to [s b c r]
+        # print("6. contiguous: ", input.is_contiguous(), input.shape, input.stride())
+        # input.register_hook(lambda g: g.permute(2, 0, 1, 3))
+        out = torch.einsum('s b c r, c d r -> c s b d', input, weight)
+        # print("7. contiguous: ", out.is_contiguous(), out.shape, out.stride())
+        # out.register_hook(lambda g: print("out grad to all_reduce:", g.is_contiguous(), g.shape, g.stride()))
+        # bias need to check if the implementation is correct
+        if bias is not None:
+            out = out + bias
+        return out
+    if tp_mode is TensorParallelLinearMode.REDUCE_SCATTER:
+        raise NotImplementedError("Currently Reduce scatter is not supported for batched column linear.")
+    raise ValueError(f"Got unexpected mode: {tp_mode}.")
