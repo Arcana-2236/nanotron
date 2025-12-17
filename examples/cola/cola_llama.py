@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch LLaMa model."""
+"""PyTorch CoLA LLaMa model with BTP."""
 
 from typing import Dict, List, Optional, Union, Tuple
 
@@ -527,6 +527,7 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         self.d_qk = config.hidden_size // config.num_attention_heads
         self.d_v = config.hidden_size // config.num_attention_heads
         self.d_model = config.hidden_size
+        self.attn_rank = config.attn_rank
         self.is_using_mup = config.is_using_mup
 
         # TODO @thomasw21: refactor so that we store that default in a single place.
@@ -590,15 +591,45 @@ class CausalSelfAttention(nn.Module, AttachableStore):
 
         # Not using GQA, thus we can batch 3 gemms at once
         # If using GQA, we can simply group KV GEMM, or simply not using groupping
-        self.qkv_proj1 = BatchedTensorParallelColumnLinear(
-            config.attn_rank,
-            config.num_key_value_heads * self.d_qk,
-            3,
-            pg=tp_pg,
-            mode=tp_mode,
-            bias=False,
-            async_communication=tp_linear_async_communication,
-        )
+        # self.qkv_proj1 = BatchedTensorParallelColumnLinear(
+        #     config.attn_rank,
+        #     config.num_key_value_heads * self.d_qk,
+        #     3,
+        #     pg=tp_pg,
+        #     mode=tp_mode,
+        #     bias=False,
+        #     async_communication=tp_linear_async_communication,
+        # )
+
+        # GQA support
+        if self.is_gqa:
+            self.q_proj1 = TensorParallelColumnLinear(
+                config.attn_rank,
+                config.num_attention_heads * self.d_qk,
+                pg=tp_pg,
+                mode=tp_mode,
+                bias=False,
+                async_communication=tp_linear_async_communication,
+            )
+            self.kv_proj1 = BatchedTensorParallelColumnLinear(
+                config.attn_rank,
+                config.num_key_value_heads * self.d_qk,
+                2,
+                pg=tp_pg,
+                mode=tp_mode,
+                bias=False,
+                async_communication=tp_linear_async_communication,
+            )
+        else:
+            self.qkv_proj1 = BatchedTensorParallelColumnLinear(
+                config.attn_rank,
+                config.num_key_value_heads * self.d_qk,
+                3,
+                pg=tp_pg,
+                mode=tp_mode,
+                bias=False,
+                async_communication=tp_linear_async_communication,
+            )
 
         # # A Column-wise TP Linear layer: rank -> hidden_size
         # self.q_proj1 = TensorParallelColumnLinear(
@@ -703,9 +734,19 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         # [seq_length, batch_size, 3 * rank]
         qkv_states = self.qkv_proj0(hidden_states, rstd)
         qkv_states = self.lr_act(qkv_states)
-        qkv_states = qkv_states.unflatten(-1, (3, -1))
-        qkv_states = self.qkv_proj1(qkv_states)
-        query_states, key_states, value_states = qkv_states.unbind(dim=0)
+
+        # GQA support
+        if self.is_gqa:
+            query_states, kv_states = torch.split(qkv_states, [self.attn_rank, 2 * self.attn_rank], dim=-1)
+            query_states = self.q_proj1(query_states)
+            kv_states = kv_states.unflatten(-1, (2, -1))
+            kv_states = self.kv_proj1(kv_states)
+            key_states, value_states = kv_states.unbind(dim=0)
+        else:
+            # Non GQA support
+            qkv_states = qkv_states.unflatten(-1, (3, -1))
+            qkv_states = self.qkv_proj1(qkv_states)
+            query_states, key_states, value_states = qkv_states.unbind(dim=0)
 
         # [seq_length, batch_size, 3, rank]
         # qkv_states = qkv_states.unflatten(-1, (3, -1))
