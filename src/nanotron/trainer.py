@@ -134,7 +134,7 @@ class DistributedTrainer:
         super().__init__()
         self.config = get_config_from_file(
             config_or_config_file, config_class=config_class, model_config_class=model_config_class
-        )
+        ) if not isinstance(config_or_config_file, Config) else config_or_config_file
         self.model_config = self.config.model.model_config
         if model_class is not None:
             CONFIG_TO_MODEL_CLASS[self.model_config.__class__.__name__] = model_class
@@ -190,6 +190,13 @@ class DistributedTrainer:
             optimizer_args=self.config.optimizer,
             parallel_context=self.parallel_context,
         )
+        # Init learning rate scheduler
+        # HAS TO BE HERE (before loading the optimizer) to resume training deterministically
+        self.lr_scheduler = lr_scheduler_builder(
+            optimizer=self.optimizer,
+            lr_scheduler_args=self.config.optimizer.learning_rate_scheduler,
+            total_training_steps=self.config.tokens.train_steps,
+        )
         log_memory(logger=logger)
         if self.init_checkpoint_path is not None and self.config.checkpoints.load_optimizer:
             load_optimizer(
@@ -201,12 +208,6 @@ class DistributedTrainer:
                 map_location="cpu",
             )
 
-        # Init learning rate scheduler
-        self.lr_scheduler = lr_scheduler_builder(
-            optimizer=self.optimizer,
-            lr_scheduler_args=self.config.optimizer.learning_rate_scheduler,
-            total_training_steps=self.config.tokens.train_steps,
-        )
         if self.init_checkpoint_path is not None and self.config.checkpoints.load_lr_scheduler:
             load_lr_scheduler(
                 lr_scheduler=self.lr_scheduler,
@@ -296,7 +297,7 @@ class DistributedTrainer:
         if dist.get_rank(self.parallel_context.world_pg) == self.logger_ranks[0] and wandb is not None:
             wandb.init(
                 project=self.config.general.project,
-                name=f"{current_time}_{self.config.general.run}",
+                name=f"{self.config.general.run}_{current_time}",
                 config={"nanotron_config": self.config.as_dict()},
             )
 
