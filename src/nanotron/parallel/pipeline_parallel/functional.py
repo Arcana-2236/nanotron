@@ -84,8 +84,9 @@ def send_to_pipeline_state_buffer(tensor: torch.Tensor, to_rank: int, p2p: P2P, 
         # Trick that backward mechanism to just send the tensor.
         dummy_input = torch.empty(1, dtype=torch.float, requires_grad=True, device="cpu")
         result = SendTensorWithoutGradientToPipelineBuffer.apply(dummy_input, tensor, to_rank, p2p, pipeline_state)
-
-    pipeline_state.register_activation_requiring_backward(result)
+    
+    if tensor.requires_grad:
+        pipeline_state.register_activation_requiring_backward(result)
 
 
 class RecvTensorFromPipelineBuffer(torch.autograd.Function):

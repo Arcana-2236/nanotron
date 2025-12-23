@@ -9,7 +9,7 @@ from nanotron.logging import log_rank
 from nanotron.optim.gradient_accumulator import GradientAccumulator
 from nanotron.parallel.data_parallel.utils import ddp_trigger_sync_in_bwd
 from nanotron.parallel.pipeline_parallel.context_manager import attach_pipeline_state_to_model
-from nanotron.parallel.pipeline_parallel.state import PipelineTrainBatchState
+from nanotron.parallel.pipeline_parallel.state import PipelineTrainBatchState, PipelineEvalBatchState
 from nanotron.parallel.pipeline_parallel.tensor_pointer import TensorPointer
 from nanotron.utils import ContextManagers
 from torch import nn as torch_nn
@@ -31,12 +31,13 @@ class PipelineEngine(ABC):
         model: torch_nn.Module,
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
         # Increment the number of backwards
-        state.nb_forwards += 1
-        log_rank(
-            f"Forward micro batch id: {state.nb_forwards}",
-            logger=logger,
-            level=logging.DEBUG,
-        )
+        if hasattr(state, "nb_forwards"):
+            state.nb_forwards += 1
+            log_rank(
+                f"Forward micro batch id: {state.nb_forwards}",
+                logger=logger,
+                level=logging.DEBUG,
+            )
 
         # IMPORTANT as it's basically the context manager storing all the intermediary activations
         state.new_micro_batch_forward()
@@ -52,8 +53,7 @@ class PipelineEngine(ABC):
             output["loss"] = output["loss"] / self.nb_microbatches
 
         # Add output as activations that require backward pass
-        if not isinstance(output["loss"], TensorPointer):
-            assert output["loss"].requires_grad
+        if not isinstance(output["loss"], TensorPointer) and output["loss"].requires_grad:
             state.register_activation_requiring_backward(output["loss"])
         return output
 
@@ -70,7 +70,7 @@ class PipelineEngine(ABC):
         # Increment the number of backwards
         state.nb_backwards += 1
         log_rank(
-            f"Backward micro batch id: {state.nb_forwards}",
+            f"Backward micro batch id: {state.nb_backwards}",
             logger=logger,
             level=logging.DEBUG,
         )
@@ -134,7 +134,7 @@ class PipelineEngine(ABC):
         nb_microbatches: int,
     ) -> Iterable[Dict[str, Union[torch.Tensor, TensorPointer]]]:
         # Assign a new state for the current batch
-        state = PipelineTrainBatchState()  # TODO: do i need state?
+        state = PipelineEvalBatchState()  # TODO: do i need state?
         self.nb_microbatches = nb_microbatches
 
         outputs = []

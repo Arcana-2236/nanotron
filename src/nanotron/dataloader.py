@@ -24,6 +24,7 @@ try:
         Dataset,
         DatasetDict,
         Features,
+        IterableDataset,
         Sequence,
         Value,
         concatenate_datasets,
@@ -87,6 +88,7 @@ def get_datasets(
     hf_dataset_or_datasets: Union[dict, str],
     hf_dataset_config_name: str,
     splits: Optional[Union[List[str], str]] = ["train", "test"],
+    streaming: bool = False,
 ) -> "DatasetDict":
     """
     Function to load dataset directly from DataArguments.
@@ -95,9 +97,11 @@ def get_datasets(
         hf_dataset_or_datasets (Union[dict, str]): dict or string. When all probabilities are 1, we concatenate the datasets instead of sampling from them.
         splits (Optional[List[str]], optional): Section of the dataset to load, defaults to "train", "test"
             Can be one of `train_ift`, `test_rl`, or `..._rm` etc. H4 datasets are divided into 6 subsets for training / testing.
+        streaming (bool, optional): If True, returns an IterableDataset which streams the data instead of downloading it. Defaults to False.
 
     Returns
         DatasetDict: DatasetDict object containing the dataset of the appropriate section with test + train parts.
+                     If streaming=True, returns IterableDatasetDict instead.
     """
 
     if isinstance(splits, str):
@@ -109,7 +113,7 @@ def get_datasets(
         #     - 'dataset1': 0.5
         #     - 'dataset2': 0.3
         #     - 'dataset3': 0.2
-        raw_datasets = _get_dataset_mix(hf_dataset_or_datasets, splits=splits)
+        raw_datasets = _get_dataset_mix(hf_dataset_or_datasets, splits=splits, streaming=streaming)
     elif isinstance(hf_dataset_or_datasets, str):
         # e.g. Dataset = "HuggingFaceH4/testing_alpaca_small"
         # Note this returns things other than just train/test, which may not be intended
@@ -119,6 +123,7 @@ def get_datasets(
                 hf_dataset_or_datasets,
                 hf_dataset_config_name,
                 split=split,
+                streaming=streaming,
             )
     else:
         raise ValueError(f"hf_dataset_or_datasets must be a dict or string but is {type(hf_dataset_or_datasets)}")
@@ -126,8 +131,40 @@ def get_datasets(
     return raw_datasets
 
 
+def get_datasets_from_disk(
+    hf_dataset_path: str,
+    splits: Optional[Union[List[str], str]] = ["train", "test"],
+) -> "DatasetDict":
+    """
+    Function to load dataset directly from DataArguments.
+
+    Args:
+        hf_dataset_path (str): string. When all probabilities are 1, we concatenate the datasets instead of sampling from them.
+        splits (Optional[List[str]], optional): Section of the dataset to load, defaults to "train", "test"
+            Can be one of `train_ift`, `test_rl`, or `..._rm` etc. H4 datasets are divided into 6 subsets for training / testing.
+
+    Returns
+        DatasetDict: DatasetDict object containing the dataset of the appropriate section with test + train parts.
+    """
+
+    if isinstance(splits, str):
+        splits = [splits]
+
+    if isinstance(hf_dataset_path, str):
+        # e.g. Dataset = "HuggingFaceH4/testing_alpaca_small"
+        # Note this returns things other than just train/test, which may not be intended
+        raw_datasets = DatasetDict()
+        for split in splits:
+            raw_datasets[split] = datasets.load_from_disk(
+                f"{hf_dataset_path}/{split}",
+            )
+    else:
+        raise ValueError(f"hf_dataset_path must be a string but is {type(hf_dataset_path)}")
+    return raw_datasets
+
+
 # Adapted from h4/src/h4/data/loading.py
-def _get_dataset_mix(dataset_dict: dict, splits: List[str] = None, seed=42) -> "DatasetDict":
+def _get_dataset_mix(dataset_dict: dict, splits: List[str] = None, seed=42, streaming: bool = False) -> "DatasetDict":
     """
     Helper function to load dataset mix from dict configuration.
 
@@ -135,6 +172,7 @@ def _get_dataset_mix(dataset_dict: dict, splits: List[str] = None, seed=42) -> "
         dataset_dict (dict): Dictionary containing the dataset names and their training proportions. By default, all test proportions are 1.
         splits (Optional[List[str]], optional): Section of the dataset to load, defaults to "train", "test"
             Can be one of `train_{ift,rm,rl}` and `test_{ift,rm,rl}`. Our datasets are typically divided into 6 subsets for training / testing.
+        streaming (bool, optional): If True, returns IterableDatasets which stream the data. Defaults to False.
     """
     raw_datasets = DatasetDict()
     raw_train_datasets = []
@@ -151,6 +189,7 @@ def _get_dataset_mix(dataset_dict: dict, splits: List[str] = None, seed=42) -> "
                     load_dataset(
                         ds,
                         split=split,
+                        streaming=streaming,
                     )
                 )
             elif "test" in split:
@@ -158,21 +197,38 @@ def _get_dataset_mix(dataset_dict: dict, splits: List[str] = None, seed=42) -> "
                     load_dataset(
                         ds,
                         split=split,
+                        streaming=streaming,
                     )
                 )
             else:
                 raise ValueError(f"Split type {split} not recognized as one of test or train.")
 
     if len(raw_train_datasets) > 0:
-        train_subsets = []
-        for dataset, frac in zip(raw_train_datasets, fracs):
-            train_subset = dataset.select(range(int(frac * len(dataset))))
-            train_subsets.append(train_subset)
-        raw_datasets["train"] = concatenate_datasets(train_subsets).shuffle(seed=seed)
+        if streaming:
+            # IterableDataset doesn't support select, len, or concatenate_datasets
+            # For streaming, we can't mix datasets with fractions - just use the first dataset
+            # or use interleave_datasets for mixing
+            from datasets import interleave_datasets
+            # Convert fracs to probabilities
+            total_frac = sum(fracs)
+            probabilities = [frac / total_frac for frac in fracs]
+            raw_datasets["train"] = interleave_datasets(raw_train_datasets, probabilities=probabilities, seed=seed)
+        else:
+            train_subsets = []
+            for dataset, frac in zip(raw_train_datasets, fracs):
+                train_subset = dataset.select(range(int(frac * len(dataset))))
+                train_subsets.append(train_subset)
+            raw_datasets["train"] = concatenate_datasets(train_subsets).shuffle(seed=seed)
 
     # No subsampling for test datasets to enable fair comparison across models
     if len(raw_test_datasets) > 0:
-        raw_datasets["test"] = concatenate_datasets(raw_test_datasets).shuffle(seed=seed)
+        if streaming:
+            from datasets import interleave_datasets
+            # For test datasets, use equal probabilities
+            probabilities = [1.0 / len(raw_test_datasets)] * len(raw_test_datasets)
+            raw_datasets["test"] = interleave_datasets(raw_test_datasets, probabilities=probabilities, seed=seed)
+        else:
+            raw_datasets["test"] = concatenate_datasets(raw_test_datasets).shuffle(seed=seed)
 
     if len(raw_datasets) == 0:
         raise ValueError(
@@ -279,7 +335,7 @@ def set_tensor_pointers(
 
 ### CAUSAL LANGUAGE MODELING ###
 def clm_process(
-    raw_dataset: "Dataset",
+    raw_dataset: Union["Dataset", "IterableDataset"],
     tokenizer: "PreTrainedTokenizerBase",
     text_column_name: str,
     dataset_processing_num_proc_per_process: int,
@@ -311,16 +367,27 @@ def clm_process(
         tokenized_batch = {k: [np.array(tokenized_texts) for tokenized_texts in v] for k, v in tokenized_batch.items()}
         return group_texts(tokenized_batch)
 
-    train_dataset = raw_dataset.map(
-        _tokenize_and_group_texts,
-        input_columns=text_column_name,
-        remove_columns=raw_dataset.column_names,
-        features=Features({"input_ids": Sequence(feature=Value(dtype="int64"), length=sequence_length + 1)}),
-        batched=True,
-        num_proc=dataset_processing_num_proc_per_process,
-        load_from_cache_file=not dataset_overwrite_cache,
-        desc=f"Grouping texts in chunks of {sequence_length+1}",
-    )
+    # Check if dataset is an IterableDataset (streaming mode)
+    is_streaming = isinstance(raw_dataset, IterableDataset)
+
+    # Build map kwargs based on dataset type
+    map_kwargs = {
+        "function": _tokenize_and_group_texts,
+        "input_columns": text_column_name,
+        "remove_columns": raw_dataset.column_names,
+        "batched": True,
+    }
+
+    # IterableDataset doesn't support num_proc, load_from_cache_file, or features
+    if not is_streaming:
+        map_kwargs.update({
+            "features": Features({"input_ids": Sequence(feature=Value(dtype="int64"), length=sequence_length + 1)}),
+            "num_proc": dataset_processing_num_proc_per_process,
+            "load_from_cache_file": not dataset_overwrite_cache,
+            "desc": f"Grouping texts in chunks of {sequence_length+1}",
+        })
+
+    train_dataset = raw_dataset.map(**map_kwargs)
     return train_dataset
 
 
@@ -440,7 +507,7 @@ def get_sampler(
 
 # Adapted from https://github.com/huggingface/transformers/blob/47e1676255e5dd86b9541f734cd4f4bdcbb50f4a/src/transformers/trainer.py#L837
 def get_train_dataloader(
-    train_dataset: "Dataset",
+    train_dataset: Union["Dataset", "IterableDataset"],
     sequence_length: int,
     parallel_context: ParallelContext,
     input_pp_rank: int,
@@ -452,16 +519,21 @@ def get_train_dataloader(
     dataloader_drop_last: bool = True,
     dataloader_pin_memory: bool = True,
     use_loop_to_round_batch_size: bool = False,
+    shuffle: bool = True,
 ) -> DataLoader:
-    if not isinstance(train_dataset, datasets.Dataset):
-        raise ValueError(f"training requires a datasets.Dataset, but got {type(train_dataset)}")
+    if not isinstance(train_dataset, (datasets.Dataset, datasets.IterableDataset)):
+        raise ValueError(f"training requires a datasets.Dataset or datasets.IterableDataset, but got {type(train_dataset)}")
+
+    is_streaming = isinstance(train_dataset, datasets.IterableDataset)
 
     # Case of ranks requiring data
     if dist.get_rank(parallel_context.pp_pg) in [
         input_pp_rank,
         output_pp_rank,
     ]:
-        train_dataset = train_dataset.with_format(type="numpy", columns=["input_ids"], output_all_columns=True)
+        # IterableDataset doesn't support with_format
+        if not is_streaming:
+            train_dataset = train_dataset.with_format(type="numpy", columns=["input_ids"], output_all_columns=True)
 
     # Case of ranks not requiring data. We give them an infinite dummy dataloader
     else:
@@ -470,13 +542,17 @@ def get_train_dataloader(
             f"Dataset has to have a single column, with `input_ids` as the column name. "
             f"Current dataset: {train_dataset}"
         )
-        dataset_length = len(train_dataset)
-        train_dataset = train_dataset.remove_columns(column_names="input_ids")
-        assert (
-            len(train_dataset) == 0
-        ), f"Dataset has to be empty after removing the `input_ids` column. Current dataset: {train_dataset}"
-        # HACK as if we remove the last column of a train_dataset, it becomes empty and it's number of rows becomes empty.
-        train_dataset = EmptyInfiniteDataset(length=dataset_length)
+        if not is_streaming:
+            dataset_length = len(train_dataset)
+            train_dataset = train_dataset.remove_columns(column_names="input_ids")
+            assert (
+                len(train_dataset) == 0
+            ), f"Dataset has to be empty after removing the `input_ids` column. Current dataset: {train_dataset}"
+            # HACK as if we remove the last column of a train_dataset, it becomes empty and it's number of rows becomes empty.
+            train_dataset = EmptyInfiniteDataset(length=dataset_length)
+        else:
+            # For streaming datasets, we can't get the length, so we use a placeholder
+            train_dataset = EmptyInfiniteDataset(length=1000000000)  # Large placeholder for streaming
         # No need to spawn a lot of workers, we can just use main
         dataloader_num_workers = 0
 
@@ -492,9 +568,9 @@ def get_train_dataloader(
     dp_rank = parallel_context.dp_pg.rank()
 
     # TODO @nouamanetazi: Remove unused columns: https://github.com/huggingface/transformers/blob/47e1676255e5dd86b9541f734cd4f4bdcbb50f4a/src/transformers/trainer.py#L852
-    # TODO @nouamanetazi: Support torch.utils.data.IterableDataset: https://github.com/huggingface/transformers/blob/47e1676255e5dd86b9541f734cd4f4bdcbb50f4a/src/transformers/trainer.py#L855-L872
 
-    train_sampler = get_sampler(
+    # IterableDataset doesn't use samplers - data is already streamed and sharded
+    train_sampler = None if is_streaming else get_sampler(
         dl_rank=dp_rank,
         dl_ranks_size=dp_ranks_size,
         train_dataset=train_dataset,
@@ -503,7 +579,15 @@ def get_train_dataloader(
         micro_batch_size=micro_batch_size,
         drop_last=dataloader_drop_last,
         consumed_train_samples=consumed_train_samples,
+        shuffle=shuffle
     )
+
+    # For streaming datasets, manually skip consumed samples for deterministic resumption
+    if is_streaming and consumed_train_samples > 0:
+        # Account for DP sharding: each rank processes 1/dp_size of global data
+        # So each rank skips its share of globally consumed samples
+        samples_to_skip = consumed_train_samples // dp_ranks_size
+        train_dataset = train_dataset.skip(samples_to_skip)
 
     return DataLoader(
         train_dataset,

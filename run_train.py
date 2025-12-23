@@ -77,13 +77,6 @@ def get_dataloader_from_data_stage(
     # Case 2: HuggingFace datasets
     elif isinstance(data.dataset, PretrainDatasetsArgs):
         log_rank("Using `datasets` library", logger=logger, level=logging.INFO, rank=0)
-        tokenizer_path = trainer.config.tokenizer.tokenizer_name_or_path
-        log_rank(
-            f"Loading tokenizer from {tokenizer_path} and transformers/hf_hub versions {tf_version, hf_hub_version}",
-            logger=logger,
-            level=logging.INFO,
-            rank=0,
-        )
 
         # We need to the 1st device to process dataset and cache it, then other devices load from cache
         with main_rank_first(trainer.parallel_context.world_pg):
@@ -103,6 +96,14 @@ def get_dataloader_from_data_stage(
                     splits=data.dataset.hf_dataset_splits,
                     streaming=data.dataset.streaming,
                 )["train"]
+
+                tokenizer_path = trainer.config.tokenizer.tokenizer_name_or_path
+                log_rank(
+                    f"Loading tokenizer from {tokenizer_path} and transformers/hf_hub versions {tf_version, hf_hub_version}",
+                    logger=logger,
+                    level=logging.INFO,
+                    rank=0,
+                )
 
                 tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
                 tokenizer.pad_token = tokenizer.eos_token
@@ -195,7 +196,185 @@ def get_dataloader_from_data_stage(
     return dataloader
 
 
-def get_dataloader(trainer: DistributedTrainer) -> Dict[str, DataLoader]:
+def detect_validation_split(dataset_args: PretrainDatasetsArgs) -> str:
+    """
+    Auto-detect validation split name from dataset.
+    Tries 'validation' > 'val' > 'test' in order.
+
+    Args:
+        dataset_args: Dataset configuration arguments
+
+    Returns:
+        str: Name of the validation split found, or None if not found
+    """
+    import os
+
+    if dataset_args.streaming:
+        # For streaming datasets, try to load and handle exceptions
+        for split_name in ['validation', 'val', 'test']:
+            try:
+                from datasets import load_dataset
+                test_ds = load_dataset(
+                    dataset_args.hf_dataset_or_datasets,
+                    dataset_args.hf_dataset_config_name,
+                    split=split_name,
+                    streaming=True
+                )
+                # If we can get an iterator, the split exists
+                next(iter(test_ds))
+                return split_name
+            except Exception:
+                continue
+        return None
+    else:
+        # For non-streaming, check available splits
+        if dataset_args.load_from_disk:
+            base_path = dataset_args.hf_dataset_or_datasets
+            for split_name in ['validation', 'val', 'test']:
+                split_path = os.path.join(base_path, split_name)
+                if os.path.exists(split_path):
+                    return split_name
+        else:
+            # Try loading each split
+            for split_name in ['validation', 'val', 'test']:
+                try:
+                    from datasets import load_dataset
+                    load_dataset(
+                        dataset_args.hf_dataset_or_datasets,
+                        dataset_args.hf_dataset_config_name,
+                        split=split_name
+                    )
+                    return split_name
+                except Exception:
+                    continue
+        return None
+
+
+def get_validation_dataloader_from_data_stage(
+    trainer: DistributedTrainer,
+    data: DataArgs,
+) -> DataLoader:
+    """
+    Returns a validation dataloader for a given data stage.
+
+    Args:
+        trainer: The distributed trainer instance
+        data: The data configuration for the current stage
+
+    Returns:
+        Optional[DataLoader]: Validation dataloader or None if no validation split found
+    """
+    # First check if validation is enabled in config
+    if trainer.config.tokens.val_check_interval <= 0 or trainer.config.tokens.limit_val_batches <= 0:
+        log_rank(
+            "Validation disabled: val_check_interval or limit_val_batches not set properly",
+            logger=logger,
+            level=logging.INFO,
+            rank=0
+        )
+        return None
+
+    # Get input/output ranks
+    input_pp_rank, output_pp_rank = get_input_output_pp_ranks(model=trainer.model)
+
+    # Case 1: Dummy data generator - no validation
+    if data.dataset is None:
+        log_rank("Dummy data generator: no validation dataset", logger=logger, level=logging.INFO, rank=0)
+        return None
+
+    # Case 2: HuggingFace datasets
+    elif isinstance(data.dataset, PretrainDatasetsArgs):
+        # Detect validation split
+        val_split = detect_validation_split(data.dataset)
+        if val_split is None:
+            log_rank(
+                "No validation split found in dataset (tried 'validation', 'val', 'test')",
+                logger=logger,
+                level=logging.WARNING,
+                rank=0
+            )
+            return None
+
+        log_rank(
+            f"Using validation split: '{val_split}'",
+            logger=logger,
+            level=logging.INFO,
+            rank=0
+        )
+
+        tokenizer_path = trainer.config.tokenizer.tokenizer_name_or_path
+
+        with main_rank_first(trainer.parallel_context.world_pg):
+            # Load validation dataset
+            if data.dataset.load_from_disk:
+                val_dataset = get_datasets_from_disk(
+                    hf_dataset_path=data.dataset.hf_dataset_or_datasets,
+                    splits=val_split,
+                )[val_split]
+            else:
+                raw_val_dataset = get_datasets(
+                    hf_dataset_or_datasets=data.dataset.hf_dataset_or_datasets,
+                    hf_dataset_config_name=data.dataset.hf_dataset_config_name,
+                    splits=val_split,
+                    streaming=data.dataset.streaming,
+                )[val_split]
+
+                # Tokenize validation dataset
+                tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+                tokenizer.pad_token = tokenizer.eos_token
+                tokenizer.padding_side = "left"
+
+                val_dataset = clm_process(
+                    raw_dataset=raw_val_dataset,
+                    tokenizer=tokenizer,
+                    text_column_name=data.dataset.text_column_name,
+                    dataset_processing_num_proc_per_process=data.dataset.dataset_processing_num_proc_per_process,
+                    dataset_overwrite_cache=data.dataset.dataset_overwrite_cache,
+                    sequence_length=trainer.sequence_length,
+                )
+
+            # Create validation dataloader (no consumed_samples, always start from beginning)
+            val_dataloader = get_train_dataloader(
+                train_dataset=val_dataset,
+                sequence_length=trainer.sequence_length,
+                parallel_context=trainer.parallel_context,
+                input_pp_rank=input_pp_rank,
+                output_pp_rank=output_pp_rank,
+                micro_batch_size=trainer.micro_batch_size,
+                consumed_train_samples=0,  # Always start from beginning for validation
+                dataloader_num_workers=data.num_loading_workers,
+                seed_worker=data.seed,
+                dataloader_drop_last=True,
+            )
+
+            return val_dataloader
+
+    # Case 3: Nanosets - not yet supported
+    elif isinstance(data.dataset, NanosetDatasetsArgs):
+        log_rank(
+            "Nanoset datasets: validation not yet supported for Nanosets",
+            logger=logger,
+            level=logging.WARNING,
+            rank=0
+        )
+        return None
+
+    return None
+
+
+def get_dataloader(trainer: DistributedTrainer) -> Dict[str, Dict[str, DataLoader]]:
+    """
+    Returns a dictionary with train and optional validation dataloaders.
+
+    Structure:
+    {
+        "stage_name": {
+            "train": <train_dataloader>,
+            "validation": <val_dataloader> or None
+        },
+        ...
+    }
+    """
     dataloaders = {}
 
     for stage_idx, stage in enumerate(trainer.config.data_stages):
@@ -217,7 +396,8 @@ def get_dataloader(trainer: DistributedTrainer) -> Dict[str, DataLoader]:
             rank=0,
         )
 
-        dataloader = (
+        # Create training dataloader (lazy or immediate)
+        train_dataloader = (
             get_dataloader_from_data_stage(
                 trainer,
                 stage.data,
@@ -225,14 +405,25 @@ def get_dataloader(trainer: DistributedTrainer) -> Dict[str, DataLoader]:
                 num_remaining_train_steps=num_remaining_train_steps,
             )
             if stage_idx == 0
-            else lambda stage=stage: get_dataloader_from_data_stage(
+            else lambda stage=stage, consumed=consumed_train_samples, remaining=num_remaining_train_steps: get_dataloader_from_data_stage(
                 trainer,
                 stage.data,
-                consumed_train_samples=consumed_train_samples,
-                num_remaining_train_steps=num_remaining_train_steps,
+                consumed_train_samples=consumed,
+                num_remaining_train_steps=remaining,
             )
         )
-        dataloaders[stage.name] = dataloader
+
+        # Create validation dataloader (only for first stage, lazy for others)
+        val_dataloader = (
+            get_validation_dataloader_from_data_stage(trainer, stage.data)
+            if stage_idx == 0
+            else lambda stage=stage: get_validation_dataloader_from_data_stage(trainer, stage.data)
+        )
+
+        dataloaders[stage.name] = {
+            "train": train_dataloader,
+            "validation": val_dataloader
+        }
     return dataloaders
 
 

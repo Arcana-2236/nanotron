@@ -84,12 +84,16 @@ class PretrainDatasetsArgs:
     dataset_processing_num_proc_per_process: Optional[int] = 1
     dataset_overwrite_cache: Optional[bool] = False
     text_column_name: Optional[str] = None
+    load_from_disk: Optional[bool] = False
+    streaming: Optional[bool] = False
 
     def __post_init__(self):
         if self.text_column_name is None:
             self.text_column_name = "text"
         if self.hf_dataset_splits is None:
             self.hf_dataset_splits = "train"
+        if self.load_from_disk and self.streaming:
+            raise ValueError("Cannot use both load_from_disk and streaming options simultaneously")
 
 
 @dataclass
@@ -256,6 +260,28 @@ class TokensArgs:
     val_check_interval: Optional[int] = -1
     limit_val_batches: Optional[int] = 0
     limit_test_batches: Optional[int] = 0
+
+    def __post_init__(self):
+        """Validate configuration parameters."""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # Check for invalid val_check_interval = 0
+        if self.val_check_interval == 0:
+            raise ValueError("val_check_interval cannot be 0. Use -1 to disable validation or a positive integer for the interval.")
+
+        # Warn if validation is partially configured
+        if self.val_check_interval > 0 and self.limit_val_batches <= 0:
+            logger.warning(
+                f"val_check_interval is {self.val_check_interval} but limit_val_batches is {self.limit_val_batches}. "
+                "Validation will be skipped. Set limit_val_batches > 0 to enable validation."
+            )
+
+        if self.limit_val_batches > 0 and self.val_check_interval <= 0:
+            logger.warning(
+                f"limit_val_batches is {self.limit_val_batches} but val_check_interval is {self.val_check_interval}. "
+                "Validation will be skipped. Set val_check_interval > 0 to enable validation."
+            )
 
 
 @dataclass

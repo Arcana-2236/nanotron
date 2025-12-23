@@ -257,7 +257,8 @@ class DistributedTrainer:
         self.iteration_step = self.metadata.last_train_step
         self.limit_val_batches = self.config.tokens.limit_val_batches
         # NOTE: the dataloader currently in use for the current training stage
-        self.current_dataloader: Optional[DataLoader] = None
+        self.current_dataloader: Optional[Iterator[Dict[str, Union[torch.Tensor, TensorPointer]]]] = None
+        self._val_dataloader_factory: Optional[Iterator[Dict[str, Union[torch.Tensor, TensorPointer]]]] = None
 
         self.post_init()
 
@@ -322,23 +323,42 @@ class DistributedTrainer:
             )
             log_rank(full_log_message, logger=logger, level=logging.INFO, rank=0)
 
-    def _update_dataloader_based_on_training_stages(self, dataloaders: Union[List[DataLoader], DataLoader]):
+    def _update_dataloader_based_on_training_stages(self, dataloaders: Union[List[DataLoader], DataLoader, Dict]):
         from collections.abc import Generator
 
         if not hasattr(self.config, "data_stages") or self.config.data_stages is None:
             if self.current_dataloader is None:
                 if isinstance(dataloaders, tuple):
                     dataloader = dataloaders[0]
+                elif isinstance(dataloaders, dict):
+                    # Check if it's the new nested format
+                    first_key = list(dataloaders.keys())[0]
+                    stage_data = dataloaders[first_key]
+                    if isinstance(stage_data, dict) and "train" in stage_data:
+                        # New format: extract train and validation dataloaders
+                        train_dl = stage_data["train"]
+                        train_dl = train_dl() if callable(train_dl) else train_dl
+                        self.current_dataloader = sanity_check_dataloader(
+                            dataloader=train_dl, parallel_context=self.parallel_context, config=self.config
+                        )
+                        # Store validation dataloader factory (don't initialize yet)
+                        self._val_dataloader_factory = stage_data.get("validation", None)
+                        return
+                    else:
+                        # Old format
+                        dataloader = stage_data
                 else:
                     dataloader = dataloaders
                 self.current_dataloader = sanity_check_dataloader(
                     dataloader=dataloader, parallel_context=self.parallel_context, config=self.config
                 )
+                self._val_dataloader_factory = None
             return
         elif isinstance(dataloaders, Generator):
             # TODO(xrsrke): this is a hacky way to handle DoReMi's dataloader
             # remove this in the next PR
             self.current_dataloader = dataloaders
+            self._val_dataloader_factory = None
             return
 
         assert len(dataloaders) > 0, "No dataloaders provided"
@@ -383,11 +403,17 @@ class DistributedTrainer:
             if (stage.start_training_step == self.iteration_step) or is_resume_from_training:
                 if self.current_dataloader is not None:
                     prev_stage_name = self.config.data_stages[stage_idx - 1].name
-                    prev_dataloader = dataloaders[prev_stage_name]
+                    prev_stage_data = dataloaders[prev_stage_name]
 
-                    if isinstance(prev_dataloader, DataLoader):
-                        # NOTE: we don't need to clear dummy data generator from memory
-                        clear_dataloader_from_memory(prev_dataloader, stage_name=stage.name)
+                    # Handle both old and new formats for clearing memory
+                    if isinstance(prev_stage_data, dict) and "train" in prev_stage_data:
+                        # New format
+                        prev_train_dl = prev_stage_data["train"]
+                        if isinstance(prev_train_dl, DataLoader):
+                            clear_dataloader_from_memory(prev_train_dl, stage_name=stage.name)
+                    elif isinstance(prev_stage_data, DataLoader):
+                        # Old format
+                        clear_dataloader_from_memory(prev_stage_data, stage_name=stage.name)
 
                 self.metadata.last_stage_idx = stage_idx
 
@@ -403,9 +429,21 @@ class DistributedTrainer:
                         rank=0,
                     )
 
-                dataloader = dataloaders[stage.name]
-                # NOTE: if a dataloader is lazy initialized, we need to call it to initialize it
-                dataloader = dataloader() if callable(dataloader) else dataloader
+                stage_data = dataloaders[stage.name]
+
+                # Handle new nested dict format
+                if isinstance(stage_data, dict) and "train" in stage_data:
+                    # Extract train dataloader
+                    dataloader = stage_data["train"]
+                    dataloader = dataloader() if callable(dataloader) else dataloader
+
+                    # Store validation dataloader factory (don't initialize)
+                    self._val_dataloader_factory = stage_data.get("validation", None)
+                else:
+                    # Old format: single dataloader
+                    dataloader = stage_data
+                    dataloader = dataloader() if callable(dataloader) else dataloader
+                    self._val_dataloader_factory = None
                 break
 
         if dataloader is not None:
@@ -477,7 +515,13 @@ class DistributedTrainer:
                 # Checkpoint
                 if self.iteration_step % self.config.checkpoints.checkpoint_interval == 0:
                     self.save_checkpoint()
-                
+
+                # Validation
+                if (self.config.tokens.val_check_interval > 0 and
+                    self._val_dataloader_factory is not None and
+                    self.iteration_step % self.config.tokens.val_check_interval == 0):
+                    self.run_validation()
+
                 if self.iteration_step == self.initial_iter_step + 5 + 3:
                     torch.cuda.cudart().cudaProfilerStop()
 
@@ -621,6 +665,55 @@ class DistributedTrainer:
         )
         return outputs
 
+    def run_validation(self) -> None:
+        """
+        Execute validation and log metrics.
+        Called from training loop when val_check_interval is reached.
+        """
+        log_rank(
+            f"[Validation] Running validation at step {self.iteration_step}",
+            logger=logger,
+            level=logging.INFO,
+            rank=0
+        )
+
+        # Reinitialize validation dataloader from factory to always start from beginning
+        if self._val_dataloader_factory is not None:
+            val_dl = self._val_dataloader_factory() if callable(self._val_dataloader_factory) else self._val_dataloader_factory
+            val_dataloader = sanity_check_dataloader(
+                dataloader=val_dl, parallel_context=self.parallel_context, config=self.config
+            )
+
+        # Set model to eval mode
+        self.model.eval()
+
+        # Run validation step
+        val_outputs = self.validation_step(dataloader=val_dataloader)
+
+        # Compute average loss across validation batches
+        if isinstance(val_outputs[0]["loss"], torch.Tensor):
+            # Sum losses from all micro-batches
+            val_loss = torch.stack([output["loss"] for output in val_outputs]).sum()
+
+            # Sync across DP ranks
+            dist.all_reduce(val_loss, group=self.parallel_context.dp_pg, op=dist.ReduceOp.AVG)
+
+            # Compute perplexity
+            val_perplexity = torch.exp(val_loss)
+
+            # Log validation metrics
+            self.validation_step_logs(val_loss=val_loss, val_perplexity=val_perplexity)
+        else:
+            log_rank(
+                "[Validation] No loss computed (not on output PP rank)",
+                logger=logger,
+                level=logging.INFO,
+                rank=0
+            )
+
+        # Set model back to train mode
+        self.model.train()
+
     def train_step_logs(
         self,
         outputs: Iterable[Dict[str, Union[torch.Tensor, TensorPointer]]],
@@ -708,6 +801,46 @@ class DistributedTrainer:
                 os.system("scancel " + os.environ["SLURM_JOB_ID"])
             else:
                 exit(0)
+
+    def validation_step_logs(
+        self,
+        val_loss: torch.Tensor,
+        val_perplexity: torch.Tensor,
+    ) -> None:
+        """
+        Log validation metrics to console, WandB, and TensorBoard.
+
+        Args:
+            val_loss: Average validation loss across all batches
+            val_perplexity: Validation perplexity (exp(loss))
+        """
+        if dist.get_rank(self.parallel_context.world_pg) in self.logger_ranks:
+            assert self.loggerwriter is not None, "loggerwriter should be defined on logger ranks"
+
+            log_entries = [
+                LogItem("val_loss", val_loss.item(), "human_format"),
+                LogItem("val_perplexity", val_perplexity.item(), "human_format"),
+            ]
+
+            # Log to console via LoggerWriter
+            log_rank(
+                f"[Validation] Step {self.iteration_step}: val_loss={val_loss.item():.4f}, val_perplexity={val_perplexity.item():.4f}",
+                logger=logger,
+                level=logging.INFO,
+            )
+
+            # Log to WandB (only rank 0)
+            if dist.get_rank(self.parallel_context.world_pg) == self.logger_ranks[0] and wandb is not None:
+                wandb.log(
+                    {
+                        "val_loss": val_loss.item(),
+                        "val_perplexity": val_perplexity.item(),
+                        "iteration_step": self.iteration_step,
+                    }
+                )
+
+            # Log to TensorBoard via LoggerWriter
+            self.loggerwriter.add_scalars_from_list(log_entries, self.iteration_step)
 
     def init_model(self) -> Union[NanotronModel, DistributedDataParallel]:
         """Initialize the model and load weights from checkpoint if needed."""
