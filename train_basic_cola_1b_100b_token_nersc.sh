@@ -1,5 +1,6 @@
 #!/bin/sh
 #SBATCH -A m4788_g
+#SBATCH -N 32
 #SBATCH -q premium
 #SBATCH -C gpu&hbm40g
 #SBATCH -t 1:00:00
@@ -19,10 +20,10 @@ TP=${TP:-1}
 PP=${PP:-1}
 
 RUN_NAME=${RUN_NAME:-"None"}
-CONFIG_NAME=${CONFIG_NAME:-"cola_llama_60m"}
-LR=${LR:-"0.004"}
-BZ=${BZ:-"8"}
-TBZ=${TBZ:-"384"}
+CONFIG_NAME=${CONFIG_NAME:-"cola_llama_1b"}
+LR=${LR:-"0.001"}
+BZ=${BZ:-"2"}
+TBZ=${TBZ:-"4096"}
 CONTINUE=${CONTINUE:-"none"}
 if [ "${CONTINUE}" != "none" ]; then
     readonly continue_from_flag="--resume_checkpoint_path=$CONTINUE"
@@ -35,8 +36,8 @@ TAG=${TAG:-"none"}
 if [ "${TAG}" != "none" ]; then
     RUN_NAME=$TAG-$RUN_NAME
 fi
-WU=${WU:-"180"}
-if [ "${WU}" != "180" ]; then
+WU=${WU:-"1200"}
+if [ "${WU}" != "1200" ]; then
     RUN_NAME=$RUN_NAME-WU-$WU
 fi
 
@@ -44,7 +45,8 @@ HF_HOME="/global/cfs/cdirs/m4645/alvinliu/workspace/datasets/.cache/huggingface"
 
 HF_HOME=$HF_HOME MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT WORLD_SIZE=$WORLD_SIZE \
     srun -u torchrun --nproc-per-node=4 --master-port=$MASTER_PORT --nnodes=$SLURM_JOB_NUM_NODES \
-    --rdzv-backend=c10d --rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT examples/cola/train_basic_cola.py \
+    --rdzv-backend=c10d --rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT -- examples/cola/train_basic_cola.py \
+    --run $RUN_NAME \
     --config-file examples/cola/config_$CONFIG_NAME.yaml \
     --hf-dataset-or-datasets /pscratch/sd/a/alvinliu/datasets/seq_len_4096 \
     --lr $LR \
