@@ -549,7 +549,7 @@ def apply_config_overrides(config, args):
         overrides_applied.append(f"general.seed = {args.seed}")
     
     # Data overrides
-    if hasattr(args, "hf_dataset_or_datasets") and config.data_stages is not None:
+    if hasattr(args, "hf_dataset_or_datasets") and args.hf_dataset_or_datasets is not None and config.data_stages is not None:
         if len(args.hf_dataset_or_datasets) > len(config.data_stages):
             raise ValueError(f"Number of hf_dataset_or_datasets provided ({len(args.hf_dataset_or_datasets)}) exceeds number of data stages ({len(config.data_stages)})")
         elif len(args.hf_dataset_or_datasets) < len(config.data_stages):
