@@ -1,5 +1,6 @@
 import datetime
 import gc
+import itertools
 import json
 import os
 import shutil
@@ -282,6 +283,115 @@ class DistributedTrainer:
         else:
             self.s3_mover = None
 
+    def _extract_compression_stats(self):
+        """Extract compression statistics from CoLA or TensorTrain models for wandb logging."""
+        stats = {}
+
+        # Try to detect ColaLayer (from basic_cola_llama.py)
+        cola_layers = []
+        tt_layers = []
+
+        for name, module in self.unwrapped_model.named_modules():
+            # Detect ColaLayer by checking class name and attributes
+            if module.__class__.__name__ == "ColaLayer":
+                cola_layers.append(module)
+            # Detect TensorTrainLinear by checking class name and attributes
+            elif module.__class__.__name__ == "TensorTrainLinear":
+                tt_layers.append(module)
+
+        # Extract CoLA statistics
+        if cola_layers:
+            total_cola_params = 0
+            total_dense_params = 0
+            rank_info = {}
+
+            for module in cola_layers:
+                # CoLA parameters: cola_a + cola_b + optional bias
+                cola_params = (
+                    module.in_features * module.rank +
+                    module.rank * module.out_features +
+                    (module.out_features if hasattr(module, 'bias') and module.bias is not None else 0)
+                )
+                # Equivalent dense parameters
+                dense_params = (
+                    module.in_features * module.out_features +
+                    (module.out_features if hasattr(module, 'bias') and module.bias is not None else 0)
+                )
+                total_cola_params += cola_params
+                total_dense_params += dense_params
+
+                # Track rank distribution
+                rank_key = f"rank_{module.rank}"
+                rank_info[rank_key] = rank_info.get(rank_key, 0) + 1
+
+            compression_ratio = total_dense_params / total_cola_params if total_cola_params > 0 else 0
+            stats.update({
+                "compression/type": "CoLA",
+                "compression/num_layers": len(cola_layers),
+                "compression/total_params": total_cola_params,
+                "compression/dense_params": total_dense_params,
+                "compression/params_saved": total_dense_params - total_cola_params,
+                "compression/ratio": compression_ratio,
+                "compression/rank_distribution": rank_info,
+            })
+
+            # Add config-specific info if available
+            if hasattr(self.model_config, 'mlp_rank'):
+                stats["compression/mlp_rank"] = self.model_config.mlp_rank
+            if hasattr(self.model_config, 'attn_rank'):
+                stats["compression/attn_rank"] = self.model_config.attn_rank
+
+        # Extract TensorTrain statistics
+        elif tt_layers:
+            total_tt_params = 0
+            total_dense_params = 0
+            rank_info = {}
+            cores_info = {}
+
+            for module in tt_layers:
+                # TT parameters: sum of all cores + optional bias
+                tt_params = sum(core.numel() for core in module.cores)
+                if hasattr(module, 'bias') and module.bias is not None:
+                    tt_params += module.bias.numel()
+
+                # Equivalent dense parameters
+                dense_params = module.in_features * module.out_features
+                if hasattr(module, 'bias') and module.bias is not None:
+                    dense_params += module.out_features
+
+                total_tt_params += tt_params
+                total_dense_params += dense_params
+
+                # Track TT ranks (convert list to string for wandb)
+                rank_key = str(module.tt_ranks)
+                rank_info[rank_key] = rank_info.get(rank_key, 0) + 1
+
+                # Track number of cores
+                cores_key = f"cores_{module.tt_cores_count}"
+                cores_info[cores_key] = cores_info.get(cores_key, 0) + 1
+
+            compression_ratio = total_dense_params / total_tt_params if total_tt_params > 0 else 0
+            stats.update({
+                "compression/type": "TensorTrain",
+                "compression/num_layers": len(tt_layers),
+                "compression/total_params": total_tt_params,
+                "compression/dense_params": total_dense_params,
+                "compression/params_saved": total_dense_params - total_tt_params,
+                "compression/ratio": compression_ratio,
+                "compression/rank_distribution": rank_info,
+                "compression/cores_distribution": cores_info,
+            })
+
+            # Add config-specific info if available
+            if hasattr(self.model_config, 'tt_rank'):
+                stats["compression/tt_rank"] = self.model_config.tt_rank
+            if hasattr(self.model_config, 'tt_cores'):
+                stats["compression/tt_cores"] = self.model_config.tt_cores
+            if hasattr(self.model_config, 'tt_rank_ratio'):
+                stats["compression/tt_rank_ratio"] = self.model_config.tt_rank_ratio
+
+        return stats
+
     def pre_training(self, *args, **kwargs):
         self._print_training_plan()
 
@@ -296,11 +406,22 @@ class DistributedTrainer:
 
         current_time = datetime.datetime.now().strftime("%d/%m/%Y_%H:%M:%S")
         if dist.get_rank(self.parallel_context.world_pg) == self.logger_ranks[0] and wandb is not None:
+            # Extract model compression statistics for wandb logging
+            model_stats = self._extract_compression_stats()
+
             wandb.init(
                 project=self.config.general.project,
+                entity=self.config.general.entity,
                 name=f"{self.config.general.run}_{current_time}",
-                config={"nanotron_config": self.config.as_dict()},
+                config={
+                    "nanotron_config": self.config.as_dict(),
+                    "model_compression": model_stats,
+                },
             )
+
+            # Log model compression statistics to wandb
+            if model_stats:
+                wandb.log(model_stats, step=0)
 
     def post_train_step(self):
 
@@ -660,7 +781,7 @@ class DistributedTrainer:
     def validation_step(self, dataloader: Iterator[Dict[str, Union[torch.Tensor, TensorPointer]]]) -> Iterable[Dict]:
         outputs = self.pipeline_engine.validate_batch_iter(
             model=self.model,
-            batch=(next(dataloader) for _ in range(self.limit_val_batches)),
+            batch=itertools.islice(dataloader, self.limit_val_batches),
             nb_microbatches=self.limit_val_batches,
         )
         return outputs
@@ -863,9 +984,13 @@ class DistributedTrainer:
                     rank=0,
                 )
             else:
-                assert (
-                    self.config.tokens.sequence_length == self.model_config.max_position_embeddings
-                ), "The tokenizer's sequence length does not match the model's maximum position embeddings."
+                if self.config.tokens.sequence_length != self.model_config.max_position_embeddings:
+                    log_rank(
+                        f"WARNING: The tokenizer's sequence length ({self.config.tokens.sequence_length}) does not match the model's maximum position embeddings ({self.model_config.max_position_embeddings}).",
+                        logger=logger,
+                        level=logging.WARNING,
+                        rank=0,
+                    )
 
         log_rank("Config:\n" + pformat(self.config), logger=logger, level=logging.INFO, rank=0)
         log_rank("Model Config:\n" + pformat(self.model_config), logger=logger, level=logging.INFO, rank=0)

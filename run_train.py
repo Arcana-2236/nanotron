@@ -7,12 +7,20 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1 # important for some distributed operations
 torchrun --nproc_per_node=8 run_train.py --config-file examples/config_tiny_llama.yaml
 ```
 """
-import argparse
+
+import argparse, os
 from typing import Dict, cast
 
 import numpy as np
 from nanotron import logging
-from nanotron.config import DataArgs, DatasetStageArgs, NanosetDatasetsArgs, PretrainDatasetsArgs
+from nanotron.config import (
+    DataArgs,
+    DatasetStageArgs,
+    NanosetDatasetsArgs,
+    PretrainDatasetsArgs,
+    get_config_from_file,
+    apply_config_overrides
+)
 from nanotron.data.dataloader_builder import build_nanoset_dataloader
 from nanotron.dataloader import (
     clm_process,
@@ -28,7 +36,7 @@ from nanotron.helpers import (
 from nanotron.logging import log_rank
 from nanotron.parallel.pipeline_parallel.utils import get_input_output_pp_ranks
 from nanotron.trainer import DistributedTrainer
-from nanotron.utils import main_rank_first
+from nanotron.utils import main_rank_first, get_args
 from torch.utils.data import DataLoader
 
 try:
@@ -55,15 +63,21 @@ def get_dataloader_from_data_stage(
     consumed_train_samples: The number of samples consumed by the model in the this stage (each stage starts from zero).
     num_remaining_train_steps: The number of remaining training steps for this stage.
     """
-    assert consumed_train_samples >= 0, "consumed_train_samples should be greater than 0"
-    assert num_remaining_train_steps >= 0, "num_remaining_train_steps should be greater than 0"
+    assert (
+        consumed_train_samples >= 0
+    ), "consumed_train_samples should be greater than 0"
+    assert (
+        num_remaining_train_steps >= 0
+    ), "num_remaining_train_steps should be greater than 0"
 
     # First, we need to know which ranks to feed the dataloader to
     input_pp_rank, output_pp_rank = get_input_output_pp_ranks(model=trainer.model)
 
     # Case 1: Dummy data generator
     if data.dataset is None:
-        log_rank("Using dummy data generator", logger=logger, level=logging.INFO, rank=0)
+        log_rank(
+            "Using dummy data generator", logger=logger, level=logging.INFO, rank=0
+        )
         dataloader = dummy_infinite_data_generator(
             micro_batch_size=trainer.micro_batch_size,
             sequence_length=trainer.sequence_length,
@@ -143,7 +157,9 @@ def get_dataloader_from_data_stage(
             if not data.dataset.streaming:
                 total_tokens_dataset = len(dataloader.dataset) * trainer.sequence_length
                 num_tokens_needed_for_training = (
-                    num_remaining_train_steps * trainer.global_batch_size * trainer.sequence_length
+                    num_remaining_train_steps
+                    * trainer.global_batch_size
+                    * trainer.sequence_length
                 )
                 assert num_tokens_needed_for_training <= total_tokens_dataset, (
                     f"Dataset is too small for steps ({total_tokens_dataset} < {num_tokens_needed_for_training}), "
@@ -160,7 +176,9 @@ def get_dataloader_from_data_stage(
     # Case 3: Nanosets
     elif isinstance(data.dataset, NanosetDatasetsArgs):
         # Get tokenizer cardinality
-        tokenizer = AutoTokenizer.from_pretrained(trainer.config.tokenizer.tokenizer_name_or_path)
+        tokenizer = AutoTokenizer.from_pretrained(
+            trainer.config.tokenizer.tokenizer_name_or_path
+        )
         token_size = 4 if len(tokenizer) > np.iinfo(np.uint16).max + 1 else 2
         del tokenizer
         # Create Nanoset
@@ -172,7 +190,8 @@ def get_dataloader_from_data_stage(
                 dataset_weights=data.dataset.dataset_weights,
                 sequence_length=trainer.sequence_length,
                 token_size=token_size,
-                train_split_num_samples=trainer.config.tokens.train_steps * trainer.global_batch_size,
+                train_split_num_samples=trainer.config.tokens.train_steps
+                * trainer.global_batch_size,
                 random_seed=data.seed,
             )
 
@@ -191,7 +210,9 @@ def get_dataloader_from_data_stage(
 
         return train_dataloader
     else:
-        raise ValueError(f"Unhandled case of `self.config.data.dataset`. Got: {data.dataset}")
+        raise ValueError(
+            f"Unhandled case of `self.config.data.dataset`. Got: {data.dataset}"
+        )
 
     return dataloader
 
@@ -211,14 +232,15 @@ def detect_validation_split(dataset_args: PretrainDatasetsArgs) -> str:
 
     if dataset_args.streaming:
         # For streaming datasets, try to load and handle exceptions
-        for split_name in ['validation', 'val', 'test']:
+        for split_name in ["validation", "val", "test"]:
             try:
                 from datasets import load_dataset
+
                 test_ds = load_dataset(
                     dataset_args.hf_dataset_or_datasets,
                     dataset_args.hf_dataset_config_name,
                     split=split_name,
-                    streaming=True
+                    streaming=True,
                 )
                 # If we can get an iterator, the split exists
                 next(iter(test_ds))
@@ -230,19 +252,20 @@ def detect_validation_split(dataset_args: PretrainDatasetsArgs) -> str:
         # For non-streaming, check available splits
         if dataset_args.load_from_disk:
             base_path = dataset_args.hf_dataset_or_datasets
-            for split_name in ['validation', 'val', 'test']:
+            for split_name in ["validation", "val", "test"]:
                 split_path = os.path.join(base_path, split_name)
                 if os.path.exists(split_path):
                     return split_name
         else:
             # Try loading each split
-            for split_name in ['validation', 'val', 'test']:
+            for split_name in ["validation", "val", "test"]:
                 try:
                     from datasets import load_dataset
+
                     load_dataset(
                         dataset_args.hf_dataset_or_datasets,
                         dataset_args.hf_dataset_config_name,
-                        split=split_name
+                        split=split_name,
                     )
                     return split_name
                 except Exception:
@@ -265,12 +288,15 @@ def get_validation_dataloader_from_data_stage(
         Optional[DataLoader]: Validation dataloader or None if no validation split found
     """
     # First check if validation is enabled in config
-    if trainer.config.tokens.val_check_interval <= 0 or trainer.config.tokens.limit_val_batches <= 0:
+    if (
+        trainer.config.tokens.val_check_interval <= 0
+        or trainer.config.tokens.limit_val_batches <= 0
+    ):
         log_rank(
             "Validation disabled: val_check_interval or limit_val_batches not set properly",
             logger=logger,
             level=logging.INFO,
-            rank=0
+            rank=0,
         )
         return None
 
@@ -279,7 +305,12 @@ def get_validation_dataloader_from_data_stage(
 
     # Case 1: Dummy data generator - no validation
     if data.dataset is None:
-        log_rank("Dummy data generator: no validation dataset", logger=logger, level=logging.INFO, rank=0)
+        log_rank(
+            "Dummy data generator: no validation dataset",
+            logger=logger,
+            level=logging.INFO,
+            rank=0,
+        )
         return None
 
     # Case 2: HuggingFace datasets
@@ -291,7 +322,7 @@ def get_validation_dataloader_from_data_stage(
                 "No validation split found in dataset (tried 'validation', 'val', 'test')",
                 logger=logger,
                 level=logging.WARNING,
-                rank=0
+                rank=0,
             )
             return None
 
@@ -299,7 +330,7 @@ def get_validation_dataloader_from_data_stage(
             f"Using validation split: '{val_split}'",
             logger=logger,
             level=logging.INFO,
-            rank=0
+            rank=0,
         )
 
         tokenizer_path = trainer.config.tokenizer.tokenizer_name_or_path
@@ -355,7 +386,7 @@ def get_validation_dataloader_from_data_stage(
             "Nanoset datasets: validation not yet supported for Nanosets",
             logger=logger,
             level=logging.WARNING,
-            rank=0
+            rank=0,
         )
         return None
 
@@ -381,7 +412,9 @@ def get_dataloader(trainer: DistributedTrainer) -> Dict[str, Dict[str, DataLoade
         # NOTE: we only create the dataloader for the first stage,
         # then we lazy initialize the dataloader for the other stages
         stage = cast(DatasetStageArgs, stage)
-        consumed_train_samples = get_consumed_train_samples_of_a_data_stage_from_ckp(stage, trainer.metadata)
+        consumed_train_samples = get_consumed_train_samples_of_a_data_stage_from_ckp(
+            stage, trainer.metadata
+        )
         assert (
             consumed_train_samples is not None
         ), f"Cannot find consumed_train_samples for stage {stage.start_training_step} in the checkpoint"
@@ -417,28 +450,30 @@ def get_dataloader(trainer: DistributedTrainer) -> Dict[str, Dict[str, DataLoade
         val_dataloader = (
             get_validation_dataloader_from_data_stage(trainer, stage.data)
             if stage_idx == 0
-            else lambda stage=stage: get_validation_dataloader_from_data_stage(trainer, stage.data)
+            else lambda stage=stage: get_validation_dataloader_from_data_stage(
+                trainer, stage.data
+            )
         )
 
         dataloaders[stage.name] = {
             "train": train_dataloader,
-            "validation": val_dataloader
+            "validation": val_dataloader,
         }
     return dataloaders
-
-
-def get_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config-file", type=str, required=True, help="Path to the YAML or python config file")
-    return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = get_args()
     config_file = args.config_file
 
+    # Load config from file
+    config = get_config_from_file(config_file)
+
+    # Apply command line overrides
+    config = apply_config_overrides(config, args)
+
     # Load trainer and data
-    trainer = DistributedTrainer(config_file)
+    trainer = DistributedTrainer(config)
     dataloader = get_dataloader(trainer)
 
     # Train

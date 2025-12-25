@@ -3,6 +3,7 @@ import inspect
 import os
 import random
 import socket
+import argparse
 from contextlib import ExitStack, contextmanager
 from typing import ContextManager, List, Optional
 
@@ -160,3 +161,139 @@ def find_free_port(min_port: int = 2000, max_port: int = 65000) -> int:
                 return port
         except OSError:
             continue
+
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config-file",
+        type=str,
+        required=True,
+        help="Path to the YAML or python config file",
+    )
+
+    # General config overrides
+    parser.add_argument(
+        "--run", type=str, default=None, help="Override run name (general.run)"
+    )
+    parser.add_argument(
+        "--tag", type=str, default=None, help="Suffix for run name (general.tag)"
+    )
+    parser.add_argument(
+        "--entity", type=str, default=None, help="Override wandb entity name (general.entity)"
+    )
+    parser.add_argument(
+        "--project",
+        type=str,
+        default=None,
+        help="Override project name (general.project)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None, help="Override random seed (general.seed)"
+    )
+    parser.add_argument(
+        "--hf-dataset-or-datasets",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Override HF dataset or datasets for each data stage (data_stages.data.dataset.hf_dataset_or_datasets)",
+    )
+
+    # Checkpoint config overrides
+    parser.add_argument(
+        "--checkpoints-path",
+        type=str,
+        default=None,
+        help="Override checkpoint save path (checkpoints.checkpoints_path)",
+    )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=None,
+        help="Override checkpoint interval (checkpoints.checkpoint_interval)",
+    )
+    parser.add_argument(
+        "--resume-checkpoint-path",
+        type=str,
+        default=None,
+        help="Override resume checkpoint path (checkpoints.resume_checkpoint_path)",
+    )
+    parser.add_argument(
+        "--save-initial-state",
+        action="store_true",
+        default=None,
+        help="Override save initial state (checkpoints.save_initial_state)",
+    )
+    parser.add_argument(
+        "--save-final-state",
+        action="store_true",
+        default=None,
+        help="Override save final state (checkpoints.save_final_state)",
+    )
+
+    # Optimizer config overrides
+    parser.add_argument(
+        "--learning-rate",
+        "--lr",
+        type=float,
+        default=None,
+        help="Override learning rate (optimizer.learning_rate_scheduler.learning_rate)",
+    )
+    parser.add_argument(
+        "--min-decay-lr",
+        type=float,
+        default=None,
+        help="Override min decay learning rate (optimizer.learning_rate_scheduler.min_decay_lr)",
+    )
+    parser.add_argument(
+        "--lr-warmup-steps",
+        type=int,
+        default=None,
+        help="Override learning rate warmup steps (optimizer.learning_rate_scheduler.lr_warmup_steps)",
+    )
+
+    # Token config overrides
+    parser.add_argument(
+        "--micro-batch-size",
+        type=int,
+        default=None,
+        help="Override micro batch size (tokens.micro_batch_size)",
+    )
+    parser.add_argument(
+        "--batch-accumulation-per-replica",
+        type=int,
+        default=None,
+        help="Override batch accumulation (tokens.batch_accumulation_per_replica)",
+    )
+    parser.add_argument(
+        "--train-steps",
+        type=int,
+        default=None,
+        help="Override train steps (tokens.train_steps)",
+    )
+    parser.add_argument(
+        "--val-check-interval",
+        type=int,
+        default=None,
+        help="Override validation check interval (tokens.val_check_interval)",
+    )
+    parser.add_argument(
+        "--dp",
+        type=int,
+        default=None,
+        help="Override dp (parallelism.dp)",
+    )
+    parser.add_argument(
+        "--tp",
+        type=int,
+        default=None,
+        help="Override tp (parallelism.tp)",
+    )
+    parser.add_argument(
+        "--pp",
+        type=int,
+        default=None,
+        help="Override pp (parallelism.pp)",
+    )
+
+    return parser.parse_args()

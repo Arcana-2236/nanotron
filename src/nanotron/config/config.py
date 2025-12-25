@@ -180,6 +180,7 @@ class GeneralArgs:
 
     Args:
         project: Name of the project (a project gather several runs in common tensorboard/hub-folders)
+        entity: Wandb entity name if available
         run: Name of the run
         step: Global step (updated when we save the checkpoint)
         consumed_train_samples: Number of samples consumed during training (should be actually just step*batch_size)
@@ -187,6 +188,7 @@ class GeneralArgs:
     """
 
     project: str
+    entity: Optional[str] = None
     run: Optional[str] = None
     seed: Optional[int] = None
     step: Optional[int] = None
@@ -519,4 +521,118 @@ def get_config_from_file(
                 f"model_config should be a dictionary or a {model_config_class} and not {config.model.model_config}"
             )
         config.model.model_config = model_config_class(**config.model.model_config)
+    return config
+
+
+def apply_config_overrides(config, args):
+    """Apply command line argument overrides to config object."""
+    overrides_applied = []
+
+    # General overrides
+    if hasattr(args, "run") and args.run is not None:
+        config.general.run = args.run
+        overrides_applied.append(f"general.run = {args.run}")
+
+    if hasattr(args, "tag") and args.tag is not None:
+        config.general.run += f"_{args.tag}"
+
+    if hasattr(args, "entity") and args.entity is not None:
+        config.general.entity = args.entity
+        overrides_applied.append(f"general.entity = {args.entity}")
+
+    if hasattr(args, "project") and args.project is not None:
+        config.general.project = args.project
+        overrides_applied.append(f"general.project = {args.project}")
+
+    if hasattr(args, "seed") and args.seed is not None:
+        config.general.seed = args.seed
+        overrides_applied.append(f"general.seed = {args.seed}")
+    
+    # Data overrides
+    if hasattr(args, "hf_dataset_or_datasets") and config.data_stages is not None:
+        if len(args.hf_dataset_or_datasets) > len(config.data_stages):
+            raise ValueError(f"Number of hf_dataset_or_datasets provided ({len(args.hf_dataset_or_datasets)}) exceeds number of data stages ({len(config.data_stages)})")
+        elif len(args.hf_dataset_or_datasets) < len(config.data_stages):
+            args.hf_dataset_or_datasets = args.hf_dataset_or_datasets + [None] * (len(config.data_stages) - len(args.hf_dataset_or_datasets))
+        for stage, dataset_path in zip(config.data_stages, args.hf_dataset_or_datasets):
+            if stage.data.dataset is not None and isinstance(stage.data.dataset, PretrainDatasetsArgs) and dataset_path is not None:
+                stage.data.dataset.hf_dataset_or_datasets = dataset_path
+                overrides_applied.append(f"data_stages.data.dataset.hf_dataset_or_datasets = {dataset_path}")
+
+    # Checkpoint overrides
+    if hasattr(args, "checkpoints_path") and args.checkpoints_path is not None:
+        config.checkpoints.checkpoints_path = Path(args.checkpoints_path)
+
+    if config.general.run is not None and config.checkpoints.checkpoints_path is not None:
+        config.checkpoints.checkpoints_path = config.checkpoints.checkpoints_path / f"{config.general.run}"
+        overrides_applied.append(f"checkpoints.checkpoints_path = {args.checkpoints_path}")
+
+    if hasattr(args, "checkpoint_interval") and args.checkpoint_interval is not None:
+        config.checkpoints.checkpoint_interval = args.checkpoint_interval
+        overrides_applied.append(f"checkpoints.checkpoint_interval = {args.checkpoint_interval}")
+
+    if hasattr(args, "resume_checkpoint_path") and args.resume_checkpoint_path is not None:
+        from datasets.download.streaming_download_manager import xPath
+        config.checkpoints.resume_checkpoint_path = xPath(args.resume_checkpoint_path)
+        overrides_applied.append(f"checkpoints.resume_checkpoint_path = {args.resume_checkpoint_path}")
+
+    if hasattr(args, "save_initial_state") and args.save_initial_state is not None:
+        config.checkpoints.save_initial_state = args.save_initial_state
+        overrides_applied.append(f"checkpoints.save_initial_state = {args.save_initial_state}")
+
+    if hasattr(args, "save_final_state") and args.save_final_state is not None:
+        config.checkpoints.save_final_state = args.save_final_state
+        overrides_applied.append(f"checkpoints.save_final_state = {args.save_final_state}")
+
+    # Optimizer overrides
+    if hasattr(args, "learning_rate") and args.learning_rate is not None:
+        config.optimizer.learning_rate_scheduler.learning_rate = args.learning_rate
+        overrides_applied.append(f"optimizer.learning_rate_scheduler.learning_rate = {args.learning_rate}")
+
+    if hasattr(args, "lr_warmup_steps") and args.lr_warmup_steps is not None:
+        config.optimizer.learning_rate_scheduler.lr_warmup_steps = args.lr_warmup_steps
+        overrides_applied.append(f"optimizer.learning_rate_scheduler.lr_warmup_steps = {args.lr_warmup_steps}")
+
+    if hasattr(args, "min_decay_lr") and args.min_decay_lr is not None:
+        config.optimizer.learning_rate_scheduler.min_decay_lr = args.min_decay_lr
+        overrides_applied.append(f"optimizer.learning_rate_scheduler.min_decay_lr = {args.min_decay_lr}")
+
+    # Token overrides
+    if hasattr(args, "micro_batch_size") and args.micro_batch_size is not None:
+        config.tokens.micro_batch_size = args.micro_batch_size
+        overrides_applied.append(f"tokens.micro_batch_size = {args.micro_batch_size}")
+
+    if hasattr(args, "batch_accumulation_per_replica") and args.batch_accumulation_per_replica is not None:
+        config.tokens.batch_accumulation_per_replica = args.batch_accumulation_per_replica
+        overrides_applied.append(f"tokens.batch_accumulation_per_replica = {args.batch_accumulation_per_replica}")
+
+    if hasattr(args, "train_steps") and args.train_steps is not None:
+        config.tokens.train_steps = args.train_steps
+        overrides_applied.append(f"tokens.train_steps = {args.train_steps}")
+
+    if hasattr(args, "val_check_interval") and args.val_check_interval is not None:
+        config.tokens.val_check_interval = args.val_check_interval
+        overrides_applied.append(f"tokens.val_check_interval = {args.val_check_interval}")
+
+    # Parallelism overrides
+    if hasattr(args, "dp") and args.dp is not None:
+        config.parallelism.dp = args.dp
+        overrides_applied.append(f"parallelism.dp = {args.dp}")
+
+    if hasattr(args, "tp") and args.tp is not None:
+        config.parallelism.tp = args.tp
+        overrides_applied.append(f"parallelism.tp = {args.tp}")
+
+    if hasattr(args, "pp") and args.pp is not None:
+        config.parallelism.pp = args.pp
+        overrides_applied.append(f"parallelism.pp = {args.pp}")
+
+    # Log applied overrides
+    if overrides_applied:
+        logger.info("=" * 50)
+        logger.info("Applied config overrides:")
+        for override in overrides_applied:
+            logger.info(f"  - {override}")
+        logger.info("=" * 50)
+
     return config
