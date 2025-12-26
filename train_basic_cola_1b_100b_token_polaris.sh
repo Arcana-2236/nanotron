@@ -30,7 +30,7 @@ BZ=${BZ:-"2"}
 TBZ=${TBZ:-"4096"}
 CONTINUE=${CONTINUE:-"none"}
 if [ "${CONTINUE}" != "none" ]; then
-    readonly continue_from_flag="--resume_checkpoint_path $CONTINUE"
+    readonly continue_from_flag="--resume-checkpoint-path $CONTINUE"
 else
     readonly continue_from_flag=""
 fi
@@ -73,7 +73,7 @@ echo "LOGFILE=$LOGFILE"
 
 export TMPDIR=/tmp
 
-mpiexec -n "$NNODES" -ppn 1 --hostfile "$PBS_NODEFILE" \
+mpiexec -n "$NNODES" -ppn 1 --hostfile "$PBS_NODEFILE" --depth 8 --cpu-bind depth \
   bash -lc "
     conda activate /home/$USER/conda-envs/nanotron-py310
     cd /eagle/TensorCompress/$USER/project/nanotron

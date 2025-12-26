@@ -25,7 +25,7 @@ BZ=${BZ:-"8"}
 TBZ=${TBZ:-"384"}
 CONTINUE=${CONTINUE:-"none"}
 if [ "${CONTINUE}" != "none" ]; then
-    readonly continue_from_flag="--resume_checkpoint_path=$CONTINUE"
+    readonly continue_from_flag="--resume-checkpoint-path=$CONTINUE"
 else
     readonly continue_from_flag=""
 fi

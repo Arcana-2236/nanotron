@@ -21,11 +21,12 @@ TP=1
 PP=1
 EP=1
 MODEL_SIZE="llama_1b"
+MODEL_ARCH="tt"
 
 RUN_NAME=${RUN_NAME:-"None"}
-CONFIG_NAME=${MODEL_SIZE}
+CONFIG_NAME=${MODEL_ARCH}_${MODEL_SIZE}
 LR=${LR:-"0.001"}
-BZ=${BZ:-"1"}
+BZ=${BZ:-"2"}
 TBZ=${TBZ:-"4096"}
 CONTINUE=${CONTINUE:-"none"}
 if [ "${CONTINUE}" != "none" ]; then
@@ -72,7 +73,7 @@ echo "LOGFILE=$LOGFILE"
 
 export TMPDIR=/tmp
 
-mpiexec -n "$NNODES" -ppn 1 --hostfile "$PBS_NODEFILE" --depth 8 --cpu-bind=depth \
+mpiexec -n "$NNODES" -ppn 1 --hostfile "$PBS_NODEFILE" --depth 8 --cpu-bind depth \
   bash -lc "
     conda activate /home/$USER/conda-envs/nanotron-py310
     cd /eagle/TensorCompress/$USER/project/nanotron
@@ -82,7 +83,7 @@ mpiexec -n "$NNODES" -ppn 1 --hostfile "$PBS_NODEFILE" --depth 8 --cpu-bind=dept
       --nnodes=$NNODES --nproc_per_node=$GPUS_PER_NODE \
       --node_rank=\$NODE_RANK \
       --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
-      -- run_train.py --config-file examples/config_${CONFIG_NAME}.yaml \
+      -- examples/tensor/train_basic_tensor.py --config-file examples/tensor/config_${CONFIG_NAME}.yaml \
       --hf-dataset-or-datasets /eagle/TensorCompress/seq_len_4096 --run $RUN_NAME \
       --entity tensor_llm --project cola \
       --lr $LR --micro-batch-size $BZ --batch-accumulation-per-replica $((TBZ / (BZ * WORLD_SIZE))) \

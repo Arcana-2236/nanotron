@@ -78,7 +78,7 @@ echo "LOGFILE=$LOGFILE"
 
 export TMPDIR=/tmp
 
-mpiexec -n "$NNODES" -ppn 1 --hostfile "$PBS_NODEFILE" \
+mpiexec -n "$NNODES" -ppn 1 --hostfile "$PBS_NODEFILE" --depth 8 --cpu-bind=depth \
   bash -lc "
     conda activate /home/$USER/conda-envs/nanotron-py310
     cd /home/$USER/nanotron
