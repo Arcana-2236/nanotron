@@ -1,5 +1,5 @@
 checkpoints:
-  checkpoint_interval: 500
+  checkpoint_interval: 100
   checkpoints_path: checkpoints
   checkpoints_path_is_shared_file_system: true
   save_initial_state: false
