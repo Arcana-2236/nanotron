@@ -779,10 +779,14 @@ class DistributedTrainer:
         return outputs, loss_avg
 
     def validation_step(self, dataloader: Iterator[Dict[str, Union[torch.Tensor, TensorPointer]]]) -> Iterable[Dict]:
+        # Convert to list to count actual batches (validation dataset might be smaller than limit_val_batches)
+        batch_list = list(itertools.islice(dataloader, self.limit_val_batches))
+        actual_num_batches = len(batch_list)
+
         outputs = self.pipeline_engine.validate_batch_iter(
             model=self.model,
-            batch=itertools.islice(dataloader, self.limit_val_batches),
-            nb_microbatches=self.limit_val_batches,
+            batch=iter(batch_list),
+            nb_microbatches=actual_num_batches,
         )
         return outputs
 
