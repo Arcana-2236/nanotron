@@ -149,6 +149,69 @@ class DifferentiableReduceScatterSum(torch.autograd.Function):
         return DifferentiableAllGather.apply(grad_output, group), None
 
 
+class DifferentiableAllGatherLastDim(torch.autograd.Function):
+    """All-gather shards along the LAST dimension (dim=-1), differentiably.
+
+    Forward: concat shards along dim=-1.
+    Backward: split grad along dim=-1 (no reduce needed).
+    """
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, group: Optional[ProcessGroup]):
+        if group is None:
+            group = torch_dist.distributed_c10d._get_default_group()
+        ctx.group = group
+
+        tp = group.size()
+        if tp == 1:
+            return tensor
+
+        # Make contiguous before view/transpose
+        tensor = tensor.contiguous()
+
+        # We want to gather along last dim, but all_gather_into_tensor gathers along dim0.
+        # So reshape to 2D and swap dims: [N, d_local] -> [d_local, N], gather on dim0 -> [tp*d_local, N]
+        prefix = tensor.shape[:-1]
+        d_local = tensor.shape[-1]
+        N = int(torch.prod(torch.tensor(prefix))) if len(prefix) > 0 else 1
+
+        x2 = tensor.view(N, d_local).transpose(0, 1).contiguous()  # [d_local, N]
+
+        gathered = torch.empty(
+            tp * d_local,
+            N,
+            device=tensor.device,
+            dtype=tensor.dtype,
+            requires_grad=tensor.requires_grad,
+        )
+
+        dist.all_gather_into_tensor(gathered, x2, group=group)  # [tp*d_local, N]
+
+        # Undo transpose/reshape back to [..., tp*d_local]
+        y2 = gathered.transpose(0, 1).contiguous()  # [N, tp*d_local]
+        out = y2.view(*prefix, tp * d_local)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        group = ctx.group
+        if group is None:
+            group = torch_dist.distributed_c10d._get_default_group()
+
+        tp = group.size()
+        if tp == 1:
+            return grad_output, None
+
+        # Split grad along last dim (because forward was concat along last dim)
+        rank = dist.get_rank(group)
+        d_full = grad_output.shape[-1]
+        assert d_full % tp == 0, f"last dim {d_full} must be divisible by tp {tp}"
+        d_local = d_full // tp
+
+        grad_local = grad_output[..., rank * d_local : (rank + 1) * d_local].contiguous()
+        return grad_local, None
+
+
 # -----------------
 # Helper functions.
 # -----------------
@@ -172,3 +235,6 @@ def differentiable_reduce_scatter_sum(tensor, group: Optional[ProcessGroup] = No
 
 def differentiable_coalesced_all_reduce_sum(tensor, group: Optional[ProcessGroup] = None):
     return DifferentiableCoalescedAllReduceSum.apply(tensor, group)
+
+def differentiable_all_gather_last_dim(tensor, group: Optional[ProcessGroup] = None):
+    return DifferentiableAllGatherLastDim.apply(tensor, group)

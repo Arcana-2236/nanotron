@@ -524,9 +524,10 @@ class CausalSelfAttention(nn.Module, AttachableStore):
 
 
         q_length, batch_size, _ = query_states.shape
-        query_states = query_states.view(batch_size, q_length, self.num_attention_heads, self.d_qk)   # [batch_size, q_length, config.num_attention_heads, self.d_qk]
-        key_states = key_states.view(batch_size, q_length, self.num_key_value_heads, self.d_qk)       # [batch_size, q_length, config.num_key_value_heads, self.d_qk]
-        value_states = value_states.view(batch_size, q_length, self.num_key_value_heads, self.d_v)   # [batch_size, q_length, config.num_key_value_heads, self.d_v]
+        # Match Basic's reshape pattern: view then permute to ensure correct dimension ordering
+        query_states = query_states.view(q_length, batch_size, self.num_attention_heads, self.d_qk).permute(1, 0, 2, 3).contiguous()   # [batch_size, q_length, config.num_attention_heads, self.d_qk]
+        key_states = key_states.view(q_length, batch_size, self.num_key_value_heads, self.d_qk).permute(1, 0, 2, 3).contiguous()       # [batch_size, q_length, config.num_key_value_heads, self.d_qk]
+        value_states = value_states.view(q_length, batch_size, self.num_key_value_heads, self.d_v).permute(1, 0, 2, 3).contiguous()   # [batch_size, q_length, config.num_key_value_heads, self.d_v]
         torch.cuda.nvtx.range_pop()
         # if self.is_gqa:
         #     query_states, key_states, value_states = torch.split(
@@ -1126,6 +1127,96 @@ class VanillaColaLlamaForTraining(NanotronModel):
         )["loss"]
         return {"loss": loss}
 
+    def get_cola_std(self, module: nn.Module, module_name: str) -> Optional[float]:
+        """Calculate CoLA-specific std for a module.
+        
+        In vanilla_cola_llama.py:
+        - Down projection (proj0) must be TensorParallelColumnLinear (column split)
+        - Up projection (proj1) must be TensorParallelRowLinear (row split)
+        
+        The target_sdv uses the full dense layer dimensions (in_features + out_features),
+        not the intermediate rank dimensions, matching basic_cola_llama.py.
+        
+        Args:
+            module: The module instance
+            module_name: The name of the module
+            
+        Returns:
+            CoLA std if this is a CoLA layer, None otherwise
+        """
+        from nanotron.parallel.tensor_parallel.nn import TensorParallelRowLinear, TensorParallelColumnLinear
+        
+        # Check if this is a CoLA layer by checking module name pattern
+        is_cola_layer = "proj0" in module_name or "proj1" in module_name
+        
+        if not is_cola_layer:
+            return None
+        
+        # Determine if it's down or up projection
+        is_down_proj = "proj0" in module_name
+        
+        if is_down_proj:
+            # Down projection: must be TensorParallelColumnLinear (column split)
+            # in_features -> rank
+            if not isinstance(module, TensorParallelColumnLinear):
+                return None  # Not a valid CoLA down projection
+            
+            in_features = module.in_features  # Not sharded
+            out_features_unsharded = module.out_features * module.world_size  # Sharded
+            
+            # Determine rank (handle batched: gate_up_proj0 (2*mlp_rank) or qkv_proj0 (3*attn_rank))
+            rank = out_features_unsharded
+            if hasattr(self.config, 'mlp_rank') and out_features_unsharded % 2 == 0:
+                if out_features_unsharded == 2 * self.config.mlp_rank:
+                    rank = self.config.mlp_rank
+            elif hasattr(self.config, 'attn_rank') and out_features_unsharded % 3 == 0:
+                if out_features_unsharded == 3 * self.config.attn_rank:
+                    rank = self.config.attn_rank
+            
+            # Get the final output dimension of the full dense layer
+            if "gate_up_proj0" in module_name or "gate_proj0" in module_name or "up_proj0" in module_name:
+                final_out_features = self.config.intermediate_size
+            elif "qkv_proj0" in module_name or "q_proj0" in module_name or "k_proj0" in module_name or "v_proj0" in module_name:
+                # For attention, output is num_heads * d_qk
+                final_out_features = self.config.num_attention_heads * (self.config.hidden_size // self.config.num_attention_heads)
+            elif "o_proj0" in module_name:
+                final_out_features = self.config.hidden_size
+            elif "down_proj0" in module_name:
+                final_out_features = self.config.hidden_size
+            else:
+                return None  # Unknown layer type
+            
+            # Use full dense layer dimensions: (in_features + out_features)
+            target_sdv = (in_features + final_out_features) ** (-1 / 2)
+        else:
+            # Up projection: must be TensorParallelRowLinear (row split)
+            # rank -> out_features
+            if not isinstance(module, TensorParallelRowLinear):
+                return None  # Not a valid CoLA up projection
+            
+            in_features_unsharded = module.in_features * module.world_size  # Sharded
+            out_features = module.out_features  # Not sharded
+            rank = in_features_unsharded
+            
+            # Get the initial input dimension of the full dense layer
+            if "gate_proj1" in module_name or "up_proj1" in module_name:
+                final_in_features = self.config.hidden_size
+            elif "qkv_proj1" in module_name or "q_proj1" in module_name or "k_proj1" in module_name or "v_proj1" in module_name:
+                final_in_features = self.config.hidden_size
+            elif "o_proj1" in module_name:
+                final_in_features = self.config.num_attention_heads * (self.config.hidden_size // self.config.num_attention_heads)
+            elif "down_proj1" in module_name:
+                final_in_features = self.config.intermediate_size
+            else:
+                return None  # Unknown layer type
+            
+            # Use full dense layer dimensions: (in_features + out_features)
+            target_sdv = (final_in_features + out_features) ** (-1 / 2)
+        
+        # CoLA initialization formula (exact match with basic_cola_llama.py lines 70-76)
+        cola_std = (rank ** (-1 / 4)) * (target_sdv ** (1 / 2))
+        return cola_std
+    
     @torch.no_grad()
     def init_model_randomly(self, config: Config):
         """Initialize model parameters randomly.
@@ -1141,6 +1232,7 @@ class VanillaColaLlamaForTraining(NanotronModel):
             raise ValueError(f"Unknown init method {init_method}")
 
         parametrizator = parametrizator_cls(config=config.model)
+        original_std = parametrizator.std
 
         log_rank(
             f"Parametrizing model parameters using {parametrizator.__class__.__name__}",
@@ -1174,7 +1266,16 @@ class VanillaColaLlamaForTraining(NanotronModel):
                 continue
 
             module = model.get_submodule(module_name)
+            
+            # Check if this is a CoLA layer and get CoLA-specific std
+            cola_std = self.get_cola_std(module, module_name)
+            if cola_std is not None:
+                parametrizator.std = cola_std
+            
             parametrizator.parametrize(param_name, module)
+            
+            # Restore original std
+            parametrizator.std = original_std
 
             assert full_param_name not in initialized_parameters
             initialized_parameters.add(full_param_name)

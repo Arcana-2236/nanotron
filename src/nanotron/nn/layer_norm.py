@@ -1,6 +1,11 @@
 import torch
 from torch import nn
 
+from nanotron import distributed as dist
+from nanotron.parallel.sharded_parameters import (
+    SplitConfig,
+    mark_all_parameters_in_module_as_sharded,
+)
 
 class TritonLayerNorm(nn.LayerNorm):
     def forward(
@@ -56,13 +61,27 @@ class TritonRMSNorm(nn.Module):
 
 
 class DelayedTritonRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-5, device=None, dtype=None):
+    def __init__(
+        self, 
+        hidden_size,
+        pg: dist.ProcessGroup,
+        eps=1e-5, 
+        device=None, 
+        dtype=None,
+    ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.eps = eps
+        self.pg = pg
         self.weight = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
         self.register_parameter("bias", None)
         self.reset_parameters()
+
+        mark_all_parameters_in_module_as_sharded(
+            self,
+            pg=self.pg,
+            split_config=SplitConfig(split_dim=0),
+        )
 
     def reset_parameters(self):
         nn.init.ones_(self.weight)
@@ -73,7 +92,7 @@ class DelayedTritonRMSNorm(nn.Module):
         from flash_attn.ops.triton.layer_norm import layer_norm_fn
 
         # rstd = None
-        rstd = 1.0 / torch.sqrt(torch.mean(input * input, dim=-1, keepdim=True) + self.eps)
+        s_local = (input * input).sum(dim=-1, keepdim=True)  # [*,1]
         
         return layer_norm_fn(
             input,
@@ -86,4 +105,4 @@ class DelayedTritonRMSNorm(nn.Module):
             residual_in_fp32=residual_in_fp32,
             is_rms_norm=True,
             return_dropout_mask=return_dropout_mask,
-        ), rstd
+        ), s_local

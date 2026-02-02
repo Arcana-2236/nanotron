@@ -160,7 +160,7 @@ class TensorParallelRowLinear(nn.Linear):
                 )
             setattr(self, name, new_param)
 
-    def forward(self, x: torch.Tensor, rstd: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, s_local: Optional[torch.Tensor] = None) -> torch.Tensor:
         return row_linear(
             input=x,
             weight=self.weight,
@@ -168,7 +168,7 @@ class TensorParallelRowLinear(nn.Linear):
             group=self.pg,
             tp_mode=self.mode,
             async_communication=self.async_communication,
-            rstd=rstd,
+            s_local=s_local,
         )
 
     def extra_repr(self) -> str:
@@ -342,7 +342,7 @@ class BatchedTensorParallelColumnLinear(nn.Module):
             assert (
                 sum(contiguous_chunks) == out_features
             ), f"Sum of contiguous chunks ({sum(contiguous_chunks)}) must equal to out_features ({out_features})"
-        split_config = SplitConfig(split_dim=0, contiguous_chunks=contiguous_chunks)
+        split_config = SplitConfig(split_dim=1, contiguous_chunks=contiguous_chunks)
 
         mark_all_parameters_in_module_as_sharded(
             self,
@@ -369,4 +369,4 @@ class BatchedTensorParallelColumnLinear(nn.Module):
         )
 
     def extra_repr(self) -> str:
-        return f"tp_rank={dist.get_rank(self.pg)}, {super().extra_repr()}, unsharded_out_features={self.out_features * self.world_size}"
+        return f"tp_rank={dist.get_rank(self.pg)}, gemm_num={self.gemm_num}, in_features={self.in_features}, out_features_local={self.out_features_local}, unsharded_out_features={self.out_features_local * self.world_size}"

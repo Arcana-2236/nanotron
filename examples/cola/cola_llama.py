@@ -15,6 +15,7 @@
 """PyTorch CoLA LLaMa model with BTP."""
 
 from typing import Dict, List, Optional, Union, Tuple
+import math
 
 import torch
 from torch import nn
@@ -33,6 +34,7 @@ from nanotron.parallel import ParallelContext
 from nanotron.parallel.parameters import NanotronParameter
 from nanotron.parallel.pipeline_parallel.block import PipelineBlock, TensorPointer
 from nanotron.parallel.pipeline_parallel.p2p import P2P
+from nanotron.parallel.tensor_parallel.distributed_differentiable_primitives import differentiable_all_gather_last_dim
 from nanotron.parallel.tensor_parallel.functional import sharded_cross_entropy
 from nanotron.parallel.tensor_parallel.nn import (
     TensorParallelColumnLinear,
@@ -205,52 +207,6 @@ class GLUActivation(nn.Module):
         return self.act(gate_states) * up_states
 
 
-class CoLALinear(nn.Module):
-    # TODO: TP strategy designed for CoLA
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        rank: int,
-        lr_act: str,
-        pg: dist.ProcessGroup,
-        mode: TensorParallelLinearMode,
-        bias: bool = False,
-        device=None,
-        dtype=None,
-        async_communication: bool = False,
-        contiguous_chunks: Optional[Tuple[int, ...]] = None,
-        tp_recompute_allgather: bool = True,
-    ):
-        super().__init__()
-
-        self.down_proj = TensorParallelColumnLinear(
-            in_features,
-            rank,
-            pg=pg,
-            mode=mode,
-            bias=False,
-            async_communication=async_communication,
-            tp_recompute_allgather=tp_recompute_allgather,
-        )
-        self.up_proj = TensorParallelRowLinear(
-            rank,
-            out_features,
-            pg=pg,
-            mode=mode,
-            bias=bias,
-            async_communication=async_communication and mode is TensorParallelLinearMode.REDUCE_SCATTER,
-        )
-        self.lr_act = ACT2FN[lr_act]
-
-    def forward(self, hidden_states):
-        hidden_states = self.down_proj(hidden_states)
-        hidden_states = self.lr_act(hidden_states)
-        hidden_states = self.up_proj(hidden_states)
-
-        return hidden_states
-
-        
 
 class MLP(nn.Module):
     def __init__(
@@ -348,27 +304,25 @@ class MLP(nn.Module):
             async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
         )
         # A Column-wise TP Linear layer: rank -> hidden_size
-        if layer_idx == config.num_hidden_layers - 1:
-            self.down_proj1 = nn.Linear(config.mlp_rank, config.hidden_size, bias=False)
-        else:
-            self.down_proj1 = TensorParallelColumnLinear(
-                config.mlp_rank,
-                config.hidden_size,
-                pg=tp_pg,
-                mode=tp_mode,
-                bias=False,
-                async_communication=tp_linear_async_communication,
-                # contiguous_chunks=gate_up_contiguous_chunks,
-                # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
-            )
-    def forward(self, hidden_states, rstd=None):  # [seq_length, batch_size, hidden_dim]
+        self.down_proj1 = TensorParallelColumnLinear(
+            config.mlp_rank,
+            config.hidden_size,
+            pg=tp_pg,
+            mode=tp_mode,
+            bias=False,
+            async_communication=tp_linear_async_communication,
+            # contiguous_chunks=gate_up_contiguous_chunks,
+            # tp_recompute_allgather=parallel_config.tp_recompute_allgather,
+        )
+        
+    def forward(self, hidden_states, s_local=None):  # [seq_length, batch_size, hidden_dim]
         # [seq_length, batch_size, rank]
-        # lr_gate_states = self.gate_proj0(hidden_states, rstd)
-        # lr_up_states = self.up_proj0(hidden_states, rstd)
+        # lr_gate_states = self.gate_proj0(hidden_states, s_local)
+        # lr_up_states = self.up_proj0(hidden_states, s_local)
 
         # [seq_length, batch_size, 2 * rank]
         # print("1. contiguous: ", hidden_states.is_contiguous(), hidden_states.shape, hidden_states.stride())
-        merged_states = self.gate_up_proj0(hidden_states, rstd)
+        merged_states = self.gate_up_proj0(hidden_states, s_local)
         # print("2. contiguous: ", merged_states.is_contiguous(), merged_states.shape, merged_states.stride())
         merged_states = self.lr_act(merged_states)
         # print("merged_states 1.shape", merged_states.shape)
@@ -384,7 +338,7 @@ class MLP(nn.Module):
         # print("5. contiguous: ", merged_states.is_contiguous(), merged_states.shape, merged_states.stride())
         gate_states, up_states = merged_states.unbind(dim=0)
         # [seq_length, batch_size, 2 * rank]
-        # lr_up_states = self.gate_up_proj0(hidden_states, rstd)
+        # lr_up_states = self.gate_up_proj0(hidden_states, s_local)
 
         # [seq_length, batch_size, 2 * rank]
         # [seq_length, batch_size, rank]
@@ -722,7 +676,7 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         self,
         hidden_states,  # [seq_length, batch_size, hidden_size]
         sequence_mask,  # [batch_size, seq_length]
-        rstd=None,
+        s_local=None,
     ):
         from flash_attn import bert_padding
         from flash_attn.flash_attn_interface import (
@@ -732,7 +686,7 @@ class CausalSelfAttention(nn.Module, AttachableStore):
 
         torch.cuda.nvtx.range_push("qkv_proj")
         # [seq_length, batch_size, 3 * rank]
-        qkv_states = self.qkv_proj0(hidden_states, rstd)
+        qkv_states = self.qkv_proj0(hidden_states, s_local)
         qkv_states = self.lr_act(qkv_states)
 
         # GQA support
@@ -755,15 +709,15 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         # lr_query_states, lr_key_states, lr_value_states = torch.split(qkv_states, qkv_states.shape[-1] // 3, dim=-1)
 
         # Here concatenate hidden_states 3 times, not change the reduction dimension
-        # lr_query_states = self.q_proj0(hidden_states, rstd)
+        # lr_query_states = self.q_proj0(hidden_states, s_local)
         # lr_query_states = self.lr_act(lr_query_states)
         # query_states = self.q_proj1(lr_query_states)
         
-        # lr_key_states = self.k_proj0(hidden_states, rstd)
+        # lr_key_states = self.k_proj0(hidden_states, s_local)
         # lr_key_states = self.lr_act(lr_key_states)
         # key_states = self.k_proj1(lr_key_states)
         
-        # lr_value_states = self.v_proj0(hidden_states, rstd)
+        # lr_value_states = self.v_proj0(hidden_states, s_local)
         # lr_value_states = self.lr_act(lr_value_states)
         # value_states = self.v_proj1(lr_value_states)
 
@@ -1049,7 +1003,7 @@ class LlamaDecoderLayer(nn.Module):
         self.tp_pg = tp_pg
         self.config = config
         # self.input_layernorm = TritonRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.input_layernorm = DelayedTritonRMSNorm(config.hidden_size // tp_pg.size(), eps=config.rms_norm_eps)
+        self.input_layernorm = DelayedTritonRMSNorm(config.hidden_size // tp_pg.size(), eps=config.rms_norm_eps, pg=tp_pg)
         self.attn = CausalSelfAttention(
             config=config,
             parallel_config=parallel_config,
@@ -1058,7 +1012,7 @@ class LlamaDecoderLayer(nn.Module):
         )
 
         # self.post_attention_layernorm = TritonRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = DelayedTritonRMSNorm(config.hidden_size // tp_pg.size(), eps=config.rms_norm_eps)
+        self.post_attention_layernorm = DelayedTritonRMSNorm(config.hidden_size // tp_pg.size(), eps=config.rms_norm_eps, pg=tp_pg)
         self.mlp = MLP(config=config, parallel_config=parallel_config, tp_pg=tp_pg, layer_idx=layer_idx)
 
         self.recompute_layer = parallel_config.recompute_layer
@@ -1071,27 +1025,28 @@ class LlamaDecoderLayer(nn.Module):
         
         residual = hidden_states
         # torch.cuda.nvtx.range_push("attn_layernorm")
-        hidden_states, rstd = self.input_layernorm(hidden_states)
+        hidden_states, s_local = self.input_layernorm(hidden_states)
         # torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("attn")
-        output = self.attn(hidden_states=hidden_states, sequence_mask=sequence_mask, rstd=rstd)
+        output = self.attn(hidden_states=hidden_states, sequence_mask=sequence_mask, s_local=s_local)
         torch.cuda.nvtx.range_pop()
         hidden_states = output["hidden_states"]
         hidden_states = hidden_states + residual
 
         residual = hidden_states
         # torch.cuda.nvtx.range_push("post_attention_layernorm")
-        hidden_states, rstd = self.post_attention_layernorm(hidden_states)
+        hidden_states, s_local = self.post_attention_layernorm(hidden_states)
         # torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("mlp")
-        hidden_states = self.mlp(hidden_states=hidden_states, rstd=rstd)["hidden_states"]
+        hidden_states = self.mlp(hidden_states=hidden_states, s_local=s_local)["hidden_states"]
         torch.cuda.nvtx.range_pop()
-        # hidden_states = hidden_states + residual
+        hidden_states = hidden_states + residual
 
-        if self.layer_idx != self.config.num_hidden_layers - 1:
-            hidden_states = hidden_states + residual
+        if self.layer_idx == self.config.num_hidden_layers - 1:
+            # final layer, need to all-gather the hidden states
+            hidden_states = differentiable_all_gather_last_dim(hidden_states, self.tp_pg)
         return hidden_states, output["sequence_mask"]
 
     def _checkpointed_forward(
@@ -1396,6 +1351,116 @@ class ColaLlamaForTraining(NanotronModel):
         )["loss"]
         return {"loss": loss}
 
+    def get_cola_std(self, module: nn.Module, module_name: str) -> Optional[float]:
+        """Calculate CoLA-specific std for a module.
+        
+        In cola_llama.py:
+        - Down projection (proj0) must be TensorParallelRowLinear
+        - Up projection (proj1) must be TensorParallelColumnLinear or BatchedTensorParallelColumnLinear
+        
+        The target_sdv uses the full dense layer dimensions (in_features + out_features),
+        not the intermediate rank dimensions, matching basic_cola_llama.py.
+        
+        Args:
+            module: The module instance
+            module_name: The name of the module
+            
+        Returns:
+            CoLA std if this is a CoLA layer, None otherwise
+        """
+        from nanotron.parallel.tensor_parallel.nn import BatchedTensorParallelColumnLinear, TensorParallelRowLinear, TensorParallelColumnLinear
+        
+        # Check if this is a CoLA layer by checking module name pattern
+        is_cola_layer = "proj0" in module_name or "proj1" in module_name
+        
+        if not is_cola_layer:
+            return None
+        
+        # Determine if it's down or up projection
+        is_down_proj = "proj0" in module_name
+        
+        if is_down_proj:
+            # Down projection: in_features -> rank
+            in_features_unsharded = module.in_features * module.world_size
+            out_features = module.out_features
+            
+            # Determine rank (handle batched: gate_up_proj0 (2*mlp_rank) or qkv_proj0 (3*attn_rank))
+            rank = out_features
+            if hasattr(self.config, 'mlp_rank') and out_features % 2 == 0:
+                if out_features == 2 * self.config.mlp_rank:
+                    rank = self.config.mlp_rank
+            elif hasattr(self.config, 'attn_rank') and out_features % 3 == 0:
+                if out_features == 3 * self.config.attn_rank:
+                    rank = self.config.attn_rank
+            
+            # Get the final output dimension of the full dense layer
+            # For gate_up_proj0: final is intermediate_size
+            # For qkv_proj0: final is num_attention_heads * d_qk (or num_key_value_heads * d_qk)
+            # For o_proj0: final is hidden_size
+            # For down_proj0: final is hidden_size
+            if "gate_up_proj0" in module_name or "gate_proj0" in module_name or "up_proj0" in module_name:
+                final_out_features = self.config.intermediate_size
+            elif "qkv_proj0" in module_name or "q_proj0" in module_name or "k_proj0" in module_name or "v_proj0" in module_name:
+                # For attention, output is num_heads * d_qk
+                final_out_features = self.config.num_attention_heads * (self.config.hidden_size // self.config.num_attention_heads)
+            elif "o_proj0" in module_name:
+                final_out_features = self.config.hidden_size
+            elif "down_proj0" in module_name:
+                final_out_features = self.config.hidden_size
+            else:
+                return None  # Unknown layer type
+            
+            # Use full dense layer dimensions: (in_features + out_features)
+            target_sdv = (in_features_unsharded + final_out_features) ** (-1 / 2)
+        else:
+            # Up projection: rank -> out_features
+            if isinstance(module, BatchedTensorParallelColumnLinear):
+                in_features = module.in_features
+                out_features_unsharded = module.out_features_local * module.world_size
+                rank = in_features
+            elif isinstance(module, TensorParallelColumnLinear):
+                in_features = module.in_features
+                out_features_unsharded = module.out_features * module.world_size
+                rank = in_features
+            else:
+                return None  # Not a valid CoLA up projection
+            
+            # Get the initial input dimension of the full dense layer
+            # For gate_up_proj1: initial is hidden_size
+            # For qkv_proj1: initial is hidden_size
+            # For o_proj1: initial is num_attention_heads * d_qk
+            # For down_proj1: initial is intermediate_size
+            if "gate_up_proj1" in module_name or "gate_proj1" in module_name or "up_proj1" in module_name:
+                final_in_features = self.config.hidden_size
+            elif "qkv_proj1" in module_name or "q_proj1" in module_name or "k_proj1" in module_name or "v_proj1" in module_name:
+                final_in_features = self.config.hidden_size
+            elif "o_proj1" in module_name:
+                final_in_features = self.config.num_attention_heads * (self.config.hidden_size // self.config.num_attention_heads)
+            elif "down_proj1" in module_name:
+                final_in_features = self.config.intermediate_size
+            else:
+                return None  # Unknown layer type
+            
+            # Use full dense layer dimensions: (in_features + out_features)
+            target_sdv = (final_in_features + out_features_unsharded) ** (-1 / 2)
+        
+        # CoLA initialization formula (exact match with basic_cola_llama.py lines 70-76)
+        cola_std = (rank ** (-1 / 4)) * (target_sdv ** (1 / 2))
+        
+        # IMPORTANT: StandardParametrizator applies sqrt(2 * num_layers) scaling to RowLinear
+        # We need to compensate for this to match Basic's ColaLayer initialization
+        # Basic's ColaLayer uses: torch.randn(...) / rank**(1/4) * target_sdv**(1/2)
+        # which is equivalent to std = rank**(-1/4) * target_sdv**(1/2)
+        # StandardParametrizator for RowLinear divides by sqrt(2 * num_layers), so we multiply to compensate
+        # In cola_llama.py: all proj0 (down projections) are RowLinear and need compensation
+        if is_down_proj:
+            # Check if it's actually a RowLinear (all proj0 in cola_llama.py should be RowLinear)
+            if isinstance(module, TensorParallelRowLinear):
+                num_layers = self.config.num_hidden_layers
+                cola_std = cola_std * math.sqrt(2 * num_layers)
+        
+        return cola_std
+    
     @torch.no_grad()
     def init_model_randomly(self, config: Config):
         """Initialize model parameters randomly.
@@ -1411,6 +1476,7 @@ class ColaLlamaForTraining(NanotronModel):
             raise ValueError(f"Unknown init method {init_method}")
 
         parametrizator = parametrizator_cls(config=config.model)
+        original_std = parametrizator.std
 
         log_rank(
             f"Parametrizing model parameters using {parametrizator.__class__.__name__}",
@@ -1444,7 +1510,16 @@ class ColaLlamaForTraining(NanotronModel):
                 continue
 
             module = model.get_submodule(module_name)
+            
+            # Check if this is a CoLA layer and get CoLA-specific std
+            cola_std = self.get_cola_std(module, module_name)
+            if cola_std is not None:
+                parametrizator.std = cola_std
+            
             parametrizator.parametrize(param_name, module)
+            
+            # Restore original std
+            parametrizator.std = original_std
 
             assert full_param_name not in initialized_parameters
             initialized_parameters.add(full_param_name)
