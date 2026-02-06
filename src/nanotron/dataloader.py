@@ -578,25 +578,29 @@ def get_train_dataloader(
 
     # TODO @nouamanetazi: Remove unused columns: https://github.com/huggingface/transformers/blob/47e1676255e5dd86b9541f734cd4f4bdcbb50f4a/src/transformers/trainer.py#L852
 
-    # IterableDataset doesn't use samplers - data is already streamed and sharded
-    train_sampler = None if is_streaming else get_sampler(
-        dl_rank=dp_rank,
-        dl_ranks_size=dp_ranks_size,
-        train_dataset=train_dataset,
-        seed=seed_worker,
-        use_loop_to_round_batch_size=use_loop_to_round_batch_size,
-        micro_batch_size=micro_batch_size,
-        drop_last=dataloader_drop_last,
-        consumed_train_samples=consumed_train_samples,
-        shuffle=shuffle
-    )
+    if is_streaming:
+        # Shard the streaming dataset so each DP rank sees a distinct subset
+        from datasets.distributed import split_dataset_by_node
+        train_dataset = split_dataset_by_node(train_dataset, rank=dp_rank, world_size=dp_ranks_size)
 
-    # For streaming datasets, manually skip consumed samples for deterministic resumption
-    if is_streaming and consumed_train_samples > 0:
-        # Account for DP sharding: each rank processes 1/dp_size of global data
-        # So each rank skips its share of globally consumed samples
-        samples_to_skip = consumed_train_samples // dp_ranks_size
-        train_dataset = train_dataset.skip(samples_to_skip)
+        train_sampler = None
+
+        # For resumption, skip the samples this rank has already consumed
+        if consumed_train_samples > 0:
+            samples_to_skip = consumed_train_samples // dp_ranks_size
+            train_dataset = train_dataset.skip(samples_to_skip)
+    else:
+        train_sampler = get_sampler(
+            dl_rank=dp_rank,
+            dl_ranks_size=dp_ranks_size,
+            train_dataset=train_dataset,
+            seed=seed_worker,
+            use_loop_to_round_batch_size=use_loop_to_round_batch_size,
+            micro_batch_size=micro_batch_size,
+            drop_last=dataloader_drop_last,
+            consumed_train_samples=consumed_train_samples,
+            shuffle=shuffle
+        )
 
     return DataLoader(
         train_dataset,
