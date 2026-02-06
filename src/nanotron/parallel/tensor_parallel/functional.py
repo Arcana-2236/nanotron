@@ -612,7 +612,7 @@ def row_linear(
             rstd_global = torch.rsqrt(s_global.detach() / d_full + eps)           # [*, 1]
             scale = (rstd_global / rstd_local).detach()                           # [*, 1]
             # print("rstd_local", rstd_local)
-            print("rstd_global", rstd_global)
+            # print("rstd_global", rstd_global)
             # print("scale", scale)
 
             # Rescale local partial BEFORE output all-reduce
