@@ -370,11 +370,20 @@ def clm_process(
     # Check if dataset is an IterableDataset (streaming mode)
     is_streaming = isinstance(raw_dataset, IterableDataset)
 
+    # For streaming datasets, column_names can be None, causing remove_columns to fail.
+    # We need to explicitly get the columns to remove them properly.
+    columns_to_remove = raw_dataset.column_names
+    if columns_to_remove is None and is_streaming:
+        # For streaming datasets with unknown schema, select only the text column first
+        # to avoid column length mismatch after batched map
+        raw_dataset = raw_dataset.select_columns([text_column_name])
+        columns_to_remove = [text_column_name]
+
     # Build map kwargs based on dataset type
     map_kwargs = {
         "function": _tokenize_and_group_texts,
         "input_columns": text_column_name,
-        "remove_columns": raw_dataset.column_names,
+        "remove_columns": columns_to_remove,
         "batched": True,
     }
 
