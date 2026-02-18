@@ -93,6 +93,53 @@ def svd_exact_polar(G, _, cutoff=None, reverse=False):
         return (U @ torch.diag(Sigma) @ Vh).to(G.dtype)
 
 
+def apply_post_polar_norm(
+    u: torch.Tensor, norm_mode: str, eps: float = 1e-8
+) -> torch.Tensor:
+    """Apply row/col L2 normalization to the polar-factorized update u.
+
+    Matches the soft_polar_ns convention:
+      - eps is placed *inside* the sqrt: sqrt(sum_sq + 1e-7)
+      - target_norm = min(m, n) ** 0.5  (Frobenius norm of a true polar factor)
+      - Frobenius rescaling is applied once at the end
+
+    Modes
+    -----
+    "col"     : col-wise norm, then Frobenius rescale
+    "row"     : row-wise norm, then Frobenius rescale
+    "col_row" : col-wise then row-wise, then Frobenius rescale
+    "row_col" : row-wise then col-wise, then Frobenius rescale
+    "none"    : no-op
+    """
+    if norm_mode in ("none", None, ""):
+        return u
+
+    # min(m, n) ** 0.5 — Frobenius norm of a true UV^T polar factor
+    target_norm = min(u.size(-2), u.size(-1)) ** 0.5
+
+    # First normalization
+    if norm_mode in ("col", "col_row"):
+        u = u / torch.sqrt((u * u).sum(dim=-2, keepdim=True) + 1e-7)
+    elif norm_mode in ("row", "row_col"):
+        u = u / torch.sqrt((u * u).sum(dim=-1, keepdim=True) + 1e-7)
+    else:
+        raise ValueError(
+            f"Unknown norm_mode '{norm_mode}'. "
+            "Choose from: 'none', 'col', 'row', 'col_row', 'row_col'."
+        )
+
+    # Second normalization (combined modes only)
+    if norm_mode == "col_row":
+        u = u / torch.sqrt((u * u).sum(dim=-1, keepdim=True) + 1e-7)
+    elif norm_mode == "row_col":
+        u = u / torch.sqrt((u * u).sum(dim=-2, keepdim=True) + 1e-7)
+
+    # Frobenius rescaling — one single rescale at the end
+    # u = u * (target_norm / (u.norm(dim=(-2, -1), keepdim=True) + 1e-7))
+
+    return u
+
+
 class Muon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
@@ -136,6 +183,7 @@ class Muon(torch.optim.Optimizer):
         polar_args={},
         muon_mode="sgd",
         use_mup=False,
+        norm_mode="none",
     ):
         """
         Accepts standard PyTorch param groups. Each group should have a "use_muon" bool
@@ -158,6 +206,7 @@ class Muon(torch.optim.Optimizer):
             muon_mode=muon_mode,
             use_mup=use_mup,
             use_muon=False,
+            norm_mode=norm_mode,
         )
 
         super().__init__(param_groups, defaults)
@@ -289,6 +338,11 @@ class Muon(torch.optim.Optimizer):
                         raise ValueError(f"Unknown muon_mode: {muon_mode}")
 
                     u = self.polar_factorizer(g, group["ns_steps"])
+
+                    # Apply post-polar normalization if enabled
+                    norm_mode = group.get("norm_mode", "none")
+                    if norm_mode != "none":
+                        u = apply_post_polar_norm(u, norm_mode=norm_mode)
 
                     adjusted_lr = self.adjust_lr_for_muon(
                         lr,
