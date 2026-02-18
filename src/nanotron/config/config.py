@@ -344,6 +344,7 @@ class MuonOptimizerArgs:
     adam_beta1: float
     adam_beta2: float
     muon_mode: str = "sgd"
+    norm_mode: str = "none"
     use_mup: bool = False
     name: str = "muon"
 
