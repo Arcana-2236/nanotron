@@ -345,6 +345,40 @@ def init_optimizer_and_grad_accumulator(
                     lr=optimizer_args.learning_rate_scheduler.learning_rate,
                     weight_decay=optimizer_args.weight_decay,
                 )
+            
+        elif optimizer_args.optimizer_factory.name == "muon":
+            from nanotron.optim.muon import Muon
+
+            # Pre-split named_param_groups into muon vs adamw groups
+            # so that NamedOptimizer can pass the "use_muon" flag through
+            # to Muon via standard param groups.
+            muon_excluded = ["embeddings", "embed_tokens", "wte", "lm_head", "wpe"]
+            split_groups = []
+            for group in named_param_groups:
+                muon_named, adamw_named = [], []
+                for name, p in group["named_params"]:
+                    if p.ndim >= 2 and not any(ex in name for ex in muon_excluded):
+                        muon_named.append((name, p))
+                    else:
+                        adamw_named.append((name, p))
+                base = {k: v for k, v in group.items() if k != "named_params"}
+                if muon_named:
+                    split_groups.append({**base, "named_params": muon_named, "use_muon": True})
+                if adamw_named:
+                    split_groups.append({**base, "named_params": adamw_named, "use_muon": False})
+            named_param_groups = split_groups
+
+            def optimizer(param_groups):
+                return Muon(
+                    param_groups,
+                    lr=optimizer_args.learning_rate_scheduler.learning_rate,
+                    weight_decay=optimizer_args.weight_decay,
+                    momentum=optimizer_args.optimizer_factory.momentum,
+                    adamw_betas=(optimizer_args.optimizer_factory.adam_beta1, optimizer_args.optimizer_factory.adam_beta2),
+                    adamw_eps=optimizer_args.optimizer_factory.adam_eps,
+                    muon_mode=optimizer_args.optimizer_factory.muon_mode,
+                    use_mup=optimizer_args.optimizer_factory.use_mup,
+                )
 
         else:
             raise ValueError(f"Optimizer {optimizer_args.optimizer_factory.name} is not supported")

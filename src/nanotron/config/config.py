@@ -338,10 +338,21 @@ class AdamWOptimizerArgs:
 
 
 @dataclass
+class MuonOptimizerArgs:
+    momentum: float
+    adam_eps: float
+    adam_beta1: float
+    adam_beta2: float
+    muon_mode: str = "sgd"
+    use_mup: bool = False
+    name: str = "muon"
+
+
+@dataclass
 class OptimizerArgs:
     """Arguments related to the optimizer and learning rate"""
 
-    optimizer_factory: Union[SGDOptimizerArgs, AdamWOptimizerArgs]
+    optimizer_factory: Union[SGDOptimizerArgs, AdamWOptimizerArgs, MuonOptimizerArgs]
     zero_stage: int
     weight_decay: float
     clip_grad: Optional[float]
