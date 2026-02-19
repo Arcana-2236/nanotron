@@ -472,6 +472,11 @@ if __name__ == "__main__":
     # Apply command line overrides
     config = apply_config_overrides(config, args)
 
+    # Apply generic dotted-path overrides
+    if args.override:
+        from nanotron.config.config import apply_generic_overrides
+        config = apply_generic_overrides(config, args.override)
+
     # Load trainer and data
     trainer = DistributedTrainer(config)
     dataloader = get_dataloader(trainer)

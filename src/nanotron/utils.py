@@ -296,4 +296,12 @@ def get_args():
         help="Override pp (parallelism.pp)",
     )
 
+    # Generic dotted-path overrides (e.g. --override optimizer.optimizer_factory.muon_mode=sgd)
+    parser.add_argument(
+        "--override",
+        action="append",
+        default=[],
+        help="Override any config field via dotted path (e.g. optimizer.optimizer_factory.muon_mode=sgd)",
+    )
+
     return parser.parse_args()

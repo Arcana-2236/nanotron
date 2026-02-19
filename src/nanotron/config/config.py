@@ -536,6 +536,35 @@ def get_config_from_file(
     return config
 
 
+def _cast_value(value_str, current_value):
+    """Cast a string value to match the type of the current config value."""
+    if isinstance(current_value, bool):
+        return value_str.lower() in ("true", "1", "yes")
+    elif isinstance(current_value, int):
+        return int(value_str)
+    elif isinstance(current_value, float):
+        return float(value_str)
+    return value_str
+
+
+def apply_generic_overrides(config, overrides):
+    """Apply generic dotted-path overrides to config.
+
+    Usage: --override optimizer.optimizer_factory.muon_mode=sgd
+    """
+    for override in overrides:
+        key, value = override.split("=", 1)
+        parts = key.split(".")
+        obj = config
+        for part in parts[:-1]:
+            obj = getattr(obj, part)
+        field = parts[-1]
+        current = getattr(obj, field)
+        setattr(obj, field, _cast_value(value, current))
+        logger.info(f"Override: {key} = {value}")
+    return config
+
+
 def apply_config_overrides(config, args):
     """Apply command line argument overrides to config object."""
     overrides_applied = []
