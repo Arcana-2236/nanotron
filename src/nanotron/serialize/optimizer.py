@@ -130,17 +130,23 @@ def save_lr_scheduler(
 # Helper functions to move optimizer states
 @torch.no_grad()
 def state_dict_to_device(state_dict: Dict, device: str) -> Dict:
+    # Find the first tensor in state to check device (optimizer-agnostic)
+    first_state = state_dict["state"][0]
+    first_tensor = next((v for v in first_state.values() if isinstance(v, torch.Tensor)), None)
+    assert first_tensor is not None, "No tensor found in optimizer state"
     assert (
-        state_dict["state"][0]["exp_avg"].device.type == "cpu"
+        first_tensor.device.type == "cpu"
     ), "Optimizer states should be on CPU to avoid extra memory usage when loading from checkpoint"
     torch.cuda.empty_cache()
 
     for _, optim_state in sorted(state_dict["state"].items(), key=lambda x: x[0]):
-        for name, tensor in optim_state.items():
-            optim_state[name] = tensor.to(device)
+        for name, value in optim_state.items():
+            if isinstance(value, torch.Tensor):
+                optim_state[name] = value.to(device)
 
+    first_tensor_after = next((v for v in state_dict["state"][0].values() if isinstance(v, torch.Tensor)), None)
     assert (
-        state_dict["state"][0]["exp_avg"].device.type == "cuda"
+        first_tensor_after.device.type == "cuda"
     ), "Optimizer states should be on GPU because model is on GPU"
     torch.cuda.empty_cache()
 

@@ -66,11 +66,16 @@ class NamedOptimizer(InheritFromOtherOptimizer):
             state_dict["names"]
         ), f"Number of params in loaded state dict ({len(state_dict['state'])}) doesn't match number of names ({len(state_dict['names'])})"
         assert len(state_dict["state"]) > 0, "Loading empty state dict"
-        OPTIMIZER_STATE_KEYS = sorted(state_dict["state"][0].keys() - {"step"})
-        for key in OPTIMIZER_STATE_KEYS:
-            for k, state in state_dict["state"].items():
-                assert (
-                    key in state
-                ), f"Key {key} not found in state dict: {state} which corresponds to param_name: {state_dict['names'][k]}"
+        # Check if optimizer has heterogeneous state (e.g. Muon uses different
+        # state keys for muon params vs adamw params)
+        all_state_keys = [frozenset(s.keys() - {"step"}) for s in state_dict["state"].values()]
+        has_heterogeneous_state = len(set(all_state_keys)) > 1
+        if not has_heterogeneous_state:
+            OPTIMIZER_STATE_KEYS = sorted(state_dict["state"][0].keys() - {"step"})
+            for key in OPTIMIZER_STATE_KEYS:
+                for k, state in state_dict["state"].items():
+                    assert (
+                        key in state
+                    ), f"Key {key} not found in state dict: {state} which corresponds to param_name: {state_dict['names'][k]}"
 
         return super().load_state_dict(state_dict, map_location=map_location)

@@ -10,7 +10,6 @@ import warnings
 from nanotron.optim.polar_express import PolarExpress, FastApplyPolarExpress
 
 
-@torch.compile
 def jiacheng(G, steps):
     """
     Jiacheng optimized polynomials
@@ -44,7 +43,6 @@ def jiacheng(G, steps):
     return X
 
 
-@torch.compile
 def zeropower_via_newtonschulz5(G, steps):
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
@@ -75,7 +73,6 @@ def zeropower_via_newtonschulz5(G, steps):
     return X
 
 
-@torch.compile
 def svd_exact_polar(G, _, cutoff=None, reverse=False):
     """
     Exact polar factorization via SVD

@@ -180,6 +180,8 @@ def save(
             current_rank = dist.get_rank(group)
 
             for name, tensor in optim_state.items():
+                if not isinstance(tensor, torch.Tensor):
+                    continue
                 # FIXME @thomasw21: Some data is actually on `cpu`, just for this test we most it to `cuda`
                 tensor = tensor.to("cuda")
 
