@@ -374,7 +374,6 @@ def init_optimizer_and_grad_accumulator(
                     adamw_eps=optimizer_args.optimizer_factory.adam_eps,
                     muon_mode=optimizer_args.optimizer_factory.muon_mode,
                     norm_mode=optimizer_args.optimizer_factory.norm_mode,
-                    use_mup=optimizer_args.optimizer_factory.use_mup,
                 )
 
         else:

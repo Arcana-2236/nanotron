@@ -1,7 +1,7 @@
 import math
 from abc import abstractmethod
 from enum import Enum, auto
-from typing import Dict
+from typing import Dict, Optional
 
 from nanotron.config import ModelArgs
 from nanotron.nn.layer_norm import TritonRMSNorm, DelayedTritonRMSNorm
@@ -26,12 +26,12 @@ class Parametrizator:
     def __init__(self, config: ModelArgs):
         self.config = config
 
-    def parametrize(self, param_name: str, module: nn.Module):
+    def parametrize(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
         # print(f"module: {module}")
         if not isinstance(module, tuple(self.MODULE_TO_PARAMETRIZE.keys())):
             raise Exception(f"Parameter {param_name} was not initialized")
 
-        return self.MODULE_TO_PARAMETRIZE[type(module)](param_name, module)
+        return self.MODULE_TO_PARAMETRIZE[type(module)](param_name, module, module_name)
 
 
 class StandardParametrizator(Parametrizator):
@@ -51,7 +51,7 @@ class StandardParametrizator(Parametrizator):
         self.std = config.init_method.std
         self.num_layers = config.model_config.num_hidden_layers
 
-    def _parametrize_column_linear(self, param_name: str, module: nn.Module):
+    def _parametrize_column_linear(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
         assert param_name in ["weight", "bias"]
 
         if "weight" == param_name:
@@ -59,7 +59,7 @@ class StandardParametrizator(Parametrizator):
         elif "bias" == param_name:
             module.bias.zero_()
 
-    def _parametrize_row_linear(self, param_name: str, module: nn.Module):
+    def _parametrize_row_linear(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
         assert param_name in ["weight", "bias"]
 
         if "weight" == param_name:
@@ -68,7 +68,7 @@ class StandardParametrizator(Parametrizator):
         elif "bias" == param_name:
             module.bias.zero_()
 
-    def _parametrize_layer_norm(self, param_name: str, module: nn.Module):
+    def _parametrize_layer_norm(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
         assert param_name in ["weight", "bias"]
 
         if "weight" == param_name:
@@ -77,21 +77,21 @@ class StandardParametrizator(Parametrizator):
         elif "bias" == param_name:
             module.bias.zero_()
 
-    def _parametrize_embedding(self, param_name: str, module: nn.Module):
+    def _parametrize_embedding(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
         assert param_name in ["weight"]
 
         if "weight" == param_name:
             init.normal_(module.weight, mean=0.0, std=self.std)
-    
-    def _parametrize_nn_linear(self, param_name: str, module: nn.Module):
+
+    def _parametrize_nn_linear(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
         assert param_name in ["weight", "bias"]
 
         if "weight" == param_name:
             init.normal_(module.weight, mean=0.0, std=self.std)
         elif "bias" == param_name:
             module.bias.zero_()
-    
-    def _parametrize_tied_linear(self, param_name: str, module: nn.Module):
+
+    def _parametrize_tied_linear(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
         assert param_name in ["weight", "bias"]
 
         if "weight" == param_name:
@@ -126,7 +126,7 @@ class SpectralMupParametrizator(Parametrizator):
         """
         return (std / math.sqrt(fan_in)) * min(1, math.sqrt(fan_out / fan_in))
 
-    def _parametrize_mup_weight(self, param_name: str, module: nn.Module):
+    def _parametrize_mup_weight(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
         assert param_name in ["weight", "bias"]
 
         data = module.weight if param_name == "weight" else module.bias
@@ -140,10 +140,17 @@ class SpectralMupParametrizator(Parametrizator):
         else:
             raise ValueError(f"Unknown module {module}")
 
-        std = SpectralMupParametrizator._compute_spectral_std(std=self.std, fan_in=fan_in, fan_out=fan_out)
-        init.normal_(data, mean=0.0, std=std)
+        if self.use_muon:
+            if "lm_head" in module_name:
+                init.zeros_(data)
+            else:
+                std = self.std * math.sqrt(1.0 / self.config.model_config.hidden_size)
+                init.normal_(data, mean=0.0, std=std)
+        else:
+            std = SpectralMupParametrizator._compute_spectral_std(std=self.std, fan_in=fan_in, fan_out=fan_out)
+            init.normal_(data, mean=0.0, std=std)
 
-    def _parametrize_layer_norm(self, param_name: str, module: nn.Module):
+    def _parametrize_layer_norm(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
         assert param_name in ["weight", "bias"]
 
         # NOTE: you're free to change the initialization of layer norm
@@ -153,12 +160,15 @@ class SpectralMupParametrizator(Parametrizator):
         elif "bias" == param_name:
             module.bias.zero_()
 
-    def _parametrize_embedding(self, param_name: str, module: nn.Module):
+    def _parametrize_embedding(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
         assert param_name in ["weight"]
 
         # NOTE: you're free to change the initialization of input embedding/lm head
         if "weight" == param_name:
-            init.normal_(module.weight, mean=0.0, std=self.std)
+            if self.use_muon:
+                init.normal_(module.weight, mean=0.0, std=self.std * 0.1)
+            else:
+                init.normal_(module.weight, mean=0.0, std=self.std)
 
 
 class LearningRateForParametrizator:
