@@ -179,7 +179,6 @@ class Muon(torch.optim.Optimizer):
         adamw_eps=1e-8,
         polar_args={},
         muon_mode="sgd",
-        use_mup=False,
         norm_mode="none",
     ):
         """
@@ -201,7 +200,6 @@ class Muon(torch.optim.Optimizer):
             adamw_betas=adamw_betas,
             adamw_eps=adamw_eps,
             muon_mode=muon_mode,
-            use_mup=use_mup,
             use_muon=False,
             norm_mode=norm_mode,
         )
@@ -240,16 +238,11 @@ class Muon(torch.optim.Optimizer):
         param_shape,
         grad,
         grad_sign,
-        use_mup=False,
     ):
         scale = 1.0
         if rms_scaling:
             fan_out, fan_in = param_shape[:2]
-            scale *= (
-                math.sqrt(fan_out / fan_in)
-                if not use_mup
-                else math.sqrt(fan_in / fan_out)
-            )
+            scale *= math.sqrt(fan_out / fan_in)
         if nuclear_scaling:
             scale *= torch.trace(grad.T @ grad_sign)
         return lr * scale
@@ -348,7 +341,6 @@ class Muon(torch.optim.Optimizer):
                         p.shape,
                         g.bfloat16(),
                         u,
-                        use_mup=group.get("use_mup", False),
                     )
 
                     p.data.mul_(1 - lr * weight_decay)

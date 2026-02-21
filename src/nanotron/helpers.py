@@ -231,11 +231,7 @@ def get_custom_lr_for_named_parameters(
 
     assert parametrization_method in [ParametrizationMethod.SPECTRAL_MUP, ParametrizationMethod.STANDARD]
 
-    lr_mapper_cls = (
-        LearningRateForSpectralMup
-        if parametrization_method == ParametrizationMethod.SPECTRAL_MUP
-        else LearningRateForSP
-    )
+    lr_mapper_cls = LearningRateForSP
 
     log_rank(
         f"[Optimizer Building] Using {lr_mapper_cls.__name__} as learning rate",
