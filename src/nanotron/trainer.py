@@ -34,6 +34,7 @@ from nanotron.config import (
     ParallelismArgs,
     RandomInit,
     SpectralMupInit,
+    SpectralMupInitForMuon,
     get_config_from_file,
 )
 from nanotron.constants import MODEL_CONFIG_FILE_NAME
@@ -1046,7 +1047,7 @@ class DistributedTrainer:
                     parallel_context=self.parallel_context,
                     root_folder=self.config.model.init_method.path,
                 )
-            elif isinstance(self.config.model.init_method, (RandomInit, SpectralMupInit)):
+            elif isinstance(self.config.model.init_method, (RandomInit, SpectralMupInit, SpectralMupInitForMuon)):
                 unwrapped_model.init_model_randomly(config=self.config)
 
                 # Synchronize parameters so that the model is consistent
