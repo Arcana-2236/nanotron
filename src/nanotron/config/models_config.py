@@ -13,10 +13,20 @@ class SpectralMupInit:
     """This is used to initialize the model with spectral mup. Set it to True to use it."""
 
     use_mup: bool
-    use_muon: bool = False
 
     def __post_init__(self):
         assert self.use_mup, "Remove `use_mup` if you don't want to use it"
+
+@dataclass
+class SpectralMupInitForMuon:
+    """This is used to initialize the model with spectral mup. Set it to True to use it."""
+
+    use_mup: bool
+    use_muon: bool
+
+    def __post_init__(self):
+        assert self.use_mup, "Remove `use_mup` if you don't want to use it"
+        assert self.use_muon, "Remove `use_muon` if you don't want to use it"
 
 
 @dataclass

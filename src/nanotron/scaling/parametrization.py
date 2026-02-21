@@ -140,15 +140,8 @@ class SpectralMupParametrizator(Parametrizator):
         else:
             raise ValueError(f"Unknown module {module}")
 
-        if self.use_muon:
-            if "lm_head" in module_name:
-                init.zeros_(data)
-            else:
-                std = self.std * math.sqrt(1.0 / self.config.model_config.hidden_size)
-                init.normal_(data, mean=0.0, std=std)
-        else:
-            std = SpectralMupParametrizator._compute_spectral_std(std=self.std, fan_in=fan_in, fan_out=fan_out)
-            init.normal_(data, mean=0.0, std=std)
+        std = SpectralMupParametrizator._compute_spectral_std(std=self.std, fan_in=fan_in, fan_out=fan_out)
+        init.normal_(data, mean=0.0, std=std)
 
     def _parametrize_layer_norm(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
         assert param_name in ["weight", "bias"]
@@ -165,10 +158,30 @@ class SpectralMupParametrizator(Parametrizator):
 
         # NOTE: you're free to change the initialization of input embedding/lm head
         if "weight" == param_name:
-            if self.use_muon:
-                init.normal_(module.weight, mean=0.0, std=self.std * 0.1)
-            else:
-                init.normal_(module.weight, mean=0.0, std=self.std)
+            init.normal_(module.weight, mean=0.0, std=self.std)
+
+
+class SpectralMupForMuonParametrizator(SpectralMupParametrizator):
+    def __init__(self, config: ModelArgs):
+        super().__init__(config)
+
+    def _parametrize_mup_weight(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
+        assert param_name in ["weight", "bias"]
+
+        data = module.weight if param_name == "weight" else module.bias
+
+        if "lm_head" in module_name:
+            init.zeros_(data)
+        else:
+            std = self.std * math.sqrt(1.0 / self.config.model_config.hidden_size)
+            init.normal_(data, mean=0.0, std=std)
+
+    def _parametrize_embedding(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
+        assert param_name in ["weight"]
+
+        # NOTE: you're free to change the initialization of input embedding/lm head
+        if "weight" == param_name:
+            init.normal_(module.weight, mean=0.0, std=self.std * 0.1)
 
 
 class LearningRateForParametrizator:

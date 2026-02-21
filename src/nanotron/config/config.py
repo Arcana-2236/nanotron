@@ -12,7 +12,13 @@ from datasets.download.streaming_download_manager import xPath
 from yaml.loader import SafeLoader
 
 from nanotron.config.lighteval_config import LightEvalConfig
-from nanotron.config.models_config import ExistingCheckpointInit, NanotronConfigs, RandomInit, SpectralMupInit
+from nanotron.config.models_config import (
+    ExistingCheckpointInit, 
+    NanotronConfigs, 
+    RandomInit, 
+    SpectralMupInit, 
+    SpectralMupInitForMuon
+)
 from nanotron.config.parallelism_config import ParallelismArgs
 from nanotron.config.utils_config import (
     RecomputeGranularity,
@@ -222,7 +228,7 @@ class ModelArgs:
     """Arguments related to model architecture"""
 
     model_config: NanotronConfigs
-    init_method: Union[RandomInit, SpectralMupInit, ExistingCheckpointInit]
+    init_method: Union[RandomInit, SpectralMupInit, SpectralMupInitForMuon, ExistingCheckpointInit]
     dtype: Optional[torch.dtype] = None
     make_vocab_size_divisible_by: int = 1
     ddp_bucket_cap_mb: int = 25

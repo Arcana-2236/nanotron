@@ -23,7 +23,7 @@ from torch.utils.checkpoint import CheckpointFunction
 from nanotron import distributed as dist
 from nanotron import logging
 from nanotron.config import Config, LlamaConfig, ParallelismArgs
-from nanotron.config.models_config import RandomInit, SpectralMupInit
+from nanotron.config.models_config import RandomInit, SpectralMupInit, SpectralMupInitForMuon
 from nanotron.generation.generate_store import AttachableStore
 from nanotron.logging import log_rank
 from nanotron.models import NanotronModel
@@ -41,7 +41,11 @@ from nanotron.parallel.tensor_parallel.nn import (
     TensorParallelRowLinear,
 )
 from nanotron.random import RandomStates
-from nanotron.scaling.parametrization import SpectralMupParametrizator, StandardParametrizator
+from nanotron.scaling.parametrization import (
+    SpectralMupParametrizator, 
+    StandardParametrizator, 
+    SpectralMupForMuonParametrizator
+)
 from nanotron.utils import checkpoint_method
 
 logger = logging.get_logger(__name__)
@@ -1111,6 +1115,8 @@ class LlamaForTraining(NanotronModel):
             parametrizator_cls = StandardParametrizator
         elif isinstance(init_method, SpectralMupInit):
             parametrizator_cls = SpectralMupParametrizator
+        elif isinstance(init_method, SpectralMupInitForMuon):
+            parametrizator_cls = SpectralMupForMuonParametrizator
         else:
             raise ValueError(f"Unknown init method {init_method}")
 
