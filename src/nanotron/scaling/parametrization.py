@@ -3,7 +3,7 @@ from abc import abstractmethod
 from enum import Enum, auto
 from typing import Dict, Optional
 
-from nanotron.config import ModelArgs
+from nanotron.config import ModelArgs, OptimizerArgs
 from nanotron.nn.layer_norm import TritonRMSNorm, DelayedTritonRMSNorm
 from nanotron.parallel.tensor_parallel.nn import (
     TensorParallelColumnLinear,
@@ -185,8 +185,8 @@ class SpectralMupForMuonParametrizator(SpectralMupParametrizator):
 
 
 class LearningRateForParametrizator:
-    def __init__(self, lr: float, names_to_modules: Dict[str, nn.Module]):
-        self.lr = lr
+    def __init__(self, optimizer_args: OptimizerArgs, names_to_modules: Dict[str, nn.Module]):
+        self.lr = optimizer_args.learning_rate_scheduler.learning_rate
         self.names_to_modules = names_to_modules
 
     @abstractmethod
@@ -208,35 +208,14 @@ class LearningRateForSpectralMup(LearningRateForParametrizator):
     NOTE: each parameter gets a custom learning rate based on its fan-in and fan-out.
     """
 
-    def __init__(self, lr: float, names_to_modules: Dict[str, nn.Module]):
-        super().__init__(lr, names_to_modules)
-        self.MODULE_TO_PARAMETRIZE = {
-            TensorParallelColumnLinear: self._get_mup_lr,
-            TensorParallelRowLinear: self._get_mup_lr,
-            TritonRMSNorm: self._get_global_lr,
-            TensorParallelEmbedding: self._get_global_lr,
-        }
+    def __init__(self, optimizer_args: OptimizerArgs, names_to_modules: Dict[str, nn.Module]):
+        super().__init__(optimizer_args, names_to_modules)
+        self.mup_r = optimizer_args.learning_rate_scheduler.mup_r
 
-    def _get_mup_lr(self, param: nn.Parameter, module: nn.Module):
-        """
-        Parametrization 1 (Spectral parametrization)
-        Page 8, A Spectral Condition for Feature Learning by Greg Yang, et al.
+    def _get_mup_lr(self):
+        return self.lr / self.mup_r
 
-        ηₗ = Θ(nₗ/nₗ₋₁)
-        """
-        fan_in, fan_out = init._calculate_fan_in_and_fan_out(param)
-        world_size = module.world_size
-
-        if isinstance(module, TensorParallelColumnLinear):
-            fan_out = fan_out * world_size
-        elif isinstance(module, TensorParallelRowLinear):
-            fan_in = fan_in * world_size
-        else:
-            raise ValueError(f"Unknown module {module}")
-
-        return self.lr * (fan_out / fan_in)
-
-    def _get_global_lr(self, param: nn.Parameter, module: nn.Module) -> float:
+    def _get_global_lr(self) -> float:
         return self.lr
 
     def get_lr(self, param_name: str, param: nn.Parameter) -> float:
@@ -246,4 +225,20 @@ class LearningRateForSpectralMup(LearningRateForParametrizator):
         # so we remove the .weight and .bias from param_name to get the module_name
         module_name = param_name.rsplit(".", 1)[0]
         module = self.names_to_modules[module_name]
-        return self.MODULE_TO_PARAMETRIZE[type(module)](param, module)
+        match module:
+            case TensorParallelEmbedding():
+                return self._get_global_lr()
+            case TritonRMSNorm():
+                return self._get_mup_lr()
+            case TensorParallelColumnLinear():
+                if "lm_head" not in param_name:
+                    return self._get_global_lr()
+                else:
+                    return self._get_mup_lr()
+                return (
+                    self._get_global_lr() 
+                    if "lm_head" not in param_name 
+                    else self._get_mup_lr()
+                )
+            case TensorParallelRowLinear():
+                return self._get_global_lr()

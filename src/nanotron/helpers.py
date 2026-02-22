@@ -218,7 +218,7 @@ def get_custom_weight_decay_for_named_parameters(
 
 def get_custom_lr_for_named_parameters(
     parametrization_method: ParametrizationMethod,
-    lr: float,
+    optimizer_args: OptimizerArgs,
     named_parameters: Iterable[Tuple[str, torch.Tensor]],
     model: NanotronModel,
 ) -> List[Dict[str, Any]]:
@@ -231,7 +231,11 @@ def get_custom_lr_for_named_parameters(
 
     assert parametrization_method in [ParametrizationMethod.SPECTRAL_MUP, ParametrizationMethod.STANDARD]
 
-    lr_mapper_cls = LearningRateForSP
+    lr_mapper_cls = (
+        LearningRateForSP 
+        if parametrization_method != ParametrizationMethod.SPECTRAL_MUP 
+        else LearningRateForSpectralMup
+    )
 
     log_rank(
         f"[Optimizer Building] Using {lr_mapper_cls.__name__} as learning rate",
@@ -242,7 +246,7 @@ def get_custom_lr_for_named_parameters(
 
     # NOTE: since in the case of pipeline parallelism, each rank only has a subset of the model
     # so we only get the parameters that are in the current rank
-    learning_rate_mapper = lr_mapper_cls(names_to_modules=model.named_modules_in_pp_rank, lr=lr)
+    learning_rate_mapper = lr_mapper_cls(names_to_modules=model.named_modules_in_pp_rank, optimizer_args=optimizer_args)
 
     named_param_groups_with_custom_lr = []
     for (
@@ -306,7 +310,7 @@ def init_optimizer_and_grad_accumulator(
         parametrization_method=parametrization_method,
         named_parameters=named_parameters,
         model=unwrapped_model,
-        lr=optimizer_args.learning_rate_scheduler.learning_rate,
+        optimizer_args=optimizer_args
     )
     named_param_groups_with_weight_decay = get_custom_weight_decay_for_named_parameters(
         named_parameters=named_parameters,
