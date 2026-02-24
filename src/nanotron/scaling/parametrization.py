@@ -170,7 +170,7 @@ class SpectralMupForMuonParametrizator(SpectralMupParametrizator):
 
         data = module.weight if param_name == "weight" else module.bias
 
-        if "lm_head" in module_name:
+        if "lm_head" in module_name or "o_proj" in module_name or "down_proj" in module_name:
             init.zeros_(data)
         else:
             std = self.std * math.sqrt(1.0 / self.config.model_config.hidden_size)
