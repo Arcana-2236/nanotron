@@ -352,6 +352,7 @@ class MuonOptimizerArgs:
     adam_eps: float
     adam_beta1: float
     adam_beta2: float
+    ns_steps: int = 5
     muon_mode: str = "sgd"
     norm_mode: str = "none"
     name: str = "muon"

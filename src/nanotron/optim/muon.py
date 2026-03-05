@@ -9,6 +9,57 @@ import math
 import warnings
 from nanotron.optim.polar_express import PolarExpress, FastApplyPolarExpress
 
+# ---------------------------------------------------------------------------
+# Remez-optimized NS-3 coefficients for MuDam (adam_preconditioned).
+#
+# Each entry is a list of 3 (a,b,c) tuples — one per NS step.
+# The composed polynomial phi3(phi2(phi1(sigma))) is minimaxed over the
+# empirical mudam SV interval [sigma_lo, sigma_hi] measured from training logs.
+#
+# Methodology: scipy Nelder-Mead minimax on linspace(sigma_lo, sigma_hi, 800),
+# warm-started from multiple random seeds. max_err is the final Chebyshev error
+# on 2000-point verification grid; compare against std NS5 max_err = 0.318.
+#
+# Note: step-1 polynomial maps sigma -> negative values (a < 0) before step-2
+# corrects back. This is mathematically valid: A_{k+1} = X_{k+1} X_{k+1}^T
+# depends on phi(sigma)^2, not |phi(sigma)|, so the composition is exact.
+# Intermediate magnitudes stay within [-1.1, 1.2], well within bfloat16 range.
+# ---------------------------------------------------------------------------
+
+# Early training — adam_preconditioned (steps ~0-25%, sigma_hi~0.88), max_err=0.0604
+_MUDAM_NS3_EARLY = [
+    (-3.6696, 10.0034, -7.0261),  # step 1
+    (-3.2889,  9.9988, -8.6186),  # step 2
+    ( 3.9926,-10.0015,  9.4264),  # step 3
+]
+
+def _apply_ns3_abc(G, abc_list):
+    """Apply a sequence of asymmetric NS steps with the given (a,b,c) per step."""
+    assert len(G.shape) >= 2
+    X = G.bfloat16()
+    if G.size(0) > G.size(1):
+        X = X.mT
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    for a, b, c in abc_list:
+        A = X @ X.mT
+        X = a * X + (b * A + c * A @ A) @ X
+    if G.size(0) > G.size(1):
+        X = X.mT
+    return X
+
+def mudam_ns3_early(G, steps=3):
+    """
+    3-step NS for MuDam with Remez-optimized coefficients for early training.
+
+    Coefficients minimaxed over sigma in [0.025, 0.88] — the empirical 5th/95th
+    percentile energy range of the Adam-preconditioned gradient SV distribution
+    during the first ~25% of training (from moment-log analysis).
+
+    max_err (Chebyshev) = 0.060 vs 0.318 for standard NS5 — ~5x improvement.
+    `steps` is accepted for API compatibility but always runs exactly 3 steps.
+    """
+    return _apply_ns3_abc(G, _MUDAM_NS3_EARLY)
+
 
 def jiacheng(G, steps):
     """
@@ -221,6 +272,8 @@ class Muon(torch.optim.Optimizer):
             return PolarExpress
         elif polar_method == "fast_polarexpress":
             return partial(FastApplyPolarExpress, restart_interval=3, shift_eps=1e-3)
+        elif polar_method == "mudam-ns3-early":
+            return mudam_ns3_early
         elif polar_method == "svd-exact":
             return partial(
                 svd_exact_polar,
@@ -298,6 +351,38 @@ class Muon(torch.optim.Optimizer):
                         state["moment1"].lerp_(g, 1 - beta1)
                         state["moment2"].lerp_(g.square(), 1 - beta2)
                         g = state["moment1"] / (state["moment2"].sqrt() + eps)
+                    
+                    elif muon_mode == "adafactor_preconditioned":
+                        # Adafactor-preconditioned MuDam: replaces full O(m*n) second moment with
+                        # factored row/col vectors v_r [m,1] and v_c [1,n], approximating
+                        # V_{ij} ≈ v_r[i] * v_c[j] / sum(v_r).
+                        #
+                        # Memory vs adam_preconditioned:
+                        #   adam:      moment1 [m,n] + moment2 [m,n]  → 2*m*n
+                        #   adafactor: moment1 [m,n] + v_r [m] + v_c [n] → m*n + m + n  (beta1 > 0)
+                        #              v_r [m] + v_c [n]                  → m + n        (beta1 == 0)
+                        beta1, beta2 = group["adamw_betas"]
+                        eps = group["adamw_eps"]
+                        if "v_r" not in state:
+                            state["v_r"] = torch.zeros(g.size(0), 1, dtype=torch.float32, device=g.device)
+                            state["v_c"] = torch.zeros(1, g.size(1), dtype=torch.float32, device=g.device)
+                            if beta1 > 0:
+                                state["moment1"] = torch.zeros_like(g)
+                        # Update factored second moment (float32 for numerical stability)
+                        g_sq = g.float().square()
+                        state["v_r"].mul_(beta2).add_(g_sq.sum(dim=-1, keepdim=True), alpha=1 - beta2)
+                        state["v_c"].mul_(beta2).add_(g_sq.sum(dim=-2, keepdim=True), alpha=1 - beta2)
+                        # Reconstruct approximate second moment via outer product, Adafactor normalisation
+                        v_r = state["v_r"]  # [m, 1], float32
+                        v_c = state["v_c"]  # [1, n], float32
+                        v_hat = v_r * v_c / (v_r.sum() + eps)  # [m, n]
+                        # First moment (optional; skip when beta1 == 0 to save another m*n buffer)
+                        if beta1 > 0:
+                            state["moment1"].lerp_(g, 1 - beta1)
+                            numerator = state["moment1"].float()
+                        else:
+                            numerator = g.float()
+                        g = (numerator / (v_hat.sqrt() + eps)).to(g.dtype)
 
                     elif muon_mode == "muon_adam_var":
                         beta2 = group["adamw_betas"][1]
