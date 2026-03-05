@@ -72,7 +72,7 @@ optimizer:
     adam_eps: 1.0e-08
     ns_steps: 5
     polar_method: keller
-    muon_mode: sgd
+    muon_mode: adam_preconditioned
     name: muon
   weight_decay: 0.05
   zero_stage: 0
