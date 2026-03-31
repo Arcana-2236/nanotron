@@ -6,7 +6,7 @@ import torch
 
 import nanotron.distributed as dist
 
-DistributedBackend = Literal["gloo", "mpi", "nccl"]
+DistributedBackend = Literal["gloo", "mpi", "nccl", "ulfm"]
 
 
 class ParallelContext:
@@ -42,6 +42,7 @@ class ParallelContext:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.data_parallel_size = data_parallel_size
         self.expert_parallel_size = expert_parallel_size
+        self.backend = backend
 
         self._groups = {}
 
@@ -49,6 +50,9 @@ class ParallelContext:
 
         assert backend in ("nccl", "ulfm"), f"Unsupported backend: {backend}. Use 'nccl' or 'ulfm'."
 
+        # For ULFM backend, ULFMParallelContext calls initialize_torch_distributed_ulfm()
+        # before super().__init__(), so dist.is_initialized() will already be True here
+        # and this NCCL init is skipped automatically.
         if not dist.is_initialized():
             dist.initialize_torch_distributed()
 

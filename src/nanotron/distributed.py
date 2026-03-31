@@ -283,12 +283,9 @@ def initialize_torch_distributed_ulfm():
     MPI provides rank/world_size via env vars set by mpirun; no MASTER_PORT needed.
     Must be called before any other dist operations.
     """
-    rank = int(os.getenv("OMPI_COMM_WORLD_RANK", os.getenv("RANK", "0")))
-    world_size = int(os.getenv("OMPI_COMM_WORLD_SIZE", os.getenv("WORLD_SIZE", "1")))
+    # MPI backend reads rank/world_size from MPI internals (set by mpirun).
+    # We only need local_rank to pin the GPU before init.
     local_rank = int(os.getenv("OMPI_COMM_WORLD_LOCAL_RANK", os.getenv("LOCAL_RANK", "0")))
-
-    device_id = local_rank
-    torch.cuda.set_device(torch.cuda.device(device_id))
-
+    torch.cuda.set_device(torch.cuda.device(local_rank))
     dist.init_process_group(backend="ulfm")
     return True
