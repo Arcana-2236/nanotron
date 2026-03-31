@@ -473,8 +473,6 @@ def get_dataloader(trainer: DistributedTrainer) -> Dict[str, Dict[str, DataLoade
 
 
 if __name__ == "__main__":
-    import torch.distributed as dist_torch
-
     args = get_args()
     config_file = args.config_file
 
@@ -492,6 +490,8 @@ if __name__ == "__main__":
     # ULFM: inject failure simulator for fault-tolerance testing.
     # Kills DP rank 1 once at step 10 to exercise recovery.
     # Set desired_failures=0 (or remove failure_sim entirely) for production runs.
+    # Note: FailureSimulator.initialize() is called inside ULFMDistributedTrainer.__init__
+    # once the distributed process group is set up; no manual initialize() call needed here.
     failure_sim = FailureSimulator(
         seed=42,
         desired_failures=1,
