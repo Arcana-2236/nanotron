@@ -25,7 +25,6 @@ _ULFM_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..",
 if _ULFM_ROOT not in sys.path:
     sys.path.insert(0, _ULFM_ROOT)
 
-import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
@@ -65,7 +64,9 @@ class NanotronULFMTrainingManager(ULFMTrainingManager):
             dp_pg: The ULFM DP process group (from ULFMParallelContext.dp_pg).
             grad_accum_steps: Matches nanotron's batch_accumulation_per_replica.
             policy_type: "static" (initial target) or "adaptive".
-            **policy_kwargs: Forwarded to create_policy() (e.g. initial_world_size).
+            **policy_kwargs: Forwarded to create_policy(). When policy_type="static"
+                (the default), `initial_world_size` is REQUIRED, e.g.:
+                    NanotronULFMTrainingManager(..., initial_world_size=dist.get_world_size())
         """
         # Intentionally do NOT call super().__init__() — the parent creates its own
         # DistributedDataParallel wrapper and binds to dist.group.WORLD.
