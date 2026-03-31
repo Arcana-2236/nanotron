@@ -1,5 +1,5 @@
 import os
-from typing import Literal, Tuple, Annotated
+from typing import Literal, Optional, Tuple, Annotated
 
 import numpy as np
 import torch
@@ -47,7 +47,7 @@ class ParallelContext:
 
         self.set_device()
 
-        assert backend == "nccl", "Only nccl backend is supported for now."
+        assert backend in ("nccl", "ulfm"), f"Unsupported backend: {backend}. Use 'nccl' or 'ulfm'."
 
         if not dist.is_initialized():
             dist.initialize_torch_distributed()
@@ -97,7 +97,7 @@ class ParallelContext:
 
         self.world_rank_matrix: np.ndarray = ranks
 
-    def create_new_group(self, all_groups_ranks: np.ndarray) -> dist.ProcessGroup:
+    def create_new_group(self, all_groups_ranks: np.ndarray, backend: Optional[str] = None) -> dist.ProcessGroup:
         dist.barrier()
         rank = int(os.environ["RANK"])
         new_group_containing_rank = None
@@ -106,7 +106,7 @@ class ParallelContext:
 
             # add new group to `world_ranks_to_pg`
             if sorted_ranks not in self.world_ranks_to_pg:
-                new_group = dist.new_group(ranks=group_ranks)
+                new_group = dist.new_group(ranks=group_ranks, backend=backend)
                 self.world_ranks_to_pg[sorted_ranks] = new_group
             else:
                 new_group = self.world_ranks_to_pg[sorted_ranks]

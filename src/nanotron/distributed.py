@@ -275,3 +275,20 @@ def initialize_torch_distributed():
         init_method=init_method, backend=backend, world_size=world_size, rank=rank, timeout=dist.default_pg_timeout
     )
     return True
+
+
+def initialize_torch_distributed_ulfm():
+    """Initialize torch.distributed with the ULFM (MPI) backend.
+
+    MPI provides rank/world_size via env vars set by mpirun; no MASTER_PORT needed.
+    Must be called before any other dist operations.
+    """
+    rank = int(os.getenv("OMPI_COMM_WORLD_RANK", os.getenv("RANK", "0")))
+    world_size = int(os.getenv("OMPI_COMM_WORLD_SIZE", os.getenv("WORLD_SIZE", "1")))
+    local_rank = int(os.getenv("OMPI_COMM_WORLD_LOCAL_RANK", os.getenv("LOCAL_RANK", "0")))
+
+    device_id = local_rank
+    torch.cuda.set_device(torch.cuda.device(device_id))
+
+    dist.init_process_group(backend="ulfm")
+    return True

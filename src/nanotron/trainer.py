@@ -146,12 +146,7 @@ class DistributedTrainer:
         ########################################
 
         # Initialise all process groups
-        self.parallel_context = ParallelContext(
-            tensor_parallel_size=self.config.parallelism.tp,
-            pipeline_parallel_size=self.config.parallelism.pp,
-            data_parallel_size=self.config.parallelism.dp,
-            expert_parallel_size=self.config.parallelism.expert_parallel_size,
-        )
+        self.parallel_context = self._create_parallel_context()
 
         self.pre_init()
 
@@ -266,6 +261,15 @@ class DistributedTrainer:
 
     def pre_init(self):
         self.init_checkpoint_path = parse_ckpt_path(config=self.config, parallel_context=self.parallel_context)
+
+    def _create_parallel_context(self) -> ParallelContext:
+        """Factory for the parallel context. Override in subclasses to swap backend."""
+        return ParallelContext(
+            tensor_parallel_size=self.config.parallelism.tp,
+            pipeline_parallel_size=self.config.parallelism.pp,
+            data_parallel_size=self.config.parallelism.dp,
+            expert_parallel_size=self.config.parallelism.expert_parallel_size,
+        )
 
     def post_init(self):
         # S3 Mover and save initial state
