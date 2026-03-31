@@ -13,6 +13,10 @@ Changes from parent:
 
 All ULFM recovery logic lives in NanotronULFMTrainingManager / StepTxnOrchestrator /
 policy; this class only manages the nanotron-side lifecycle.
+
+Note: The `train()` override does not include the parent's profiler (`get_profiler`),
+NVTX ranges, or CUDA profiler start/stop. These are correctness-neutral omissions;
+nanotron profiling tools will not capture ULFM runs. TODO: add profiler support.
 """
 
 import gc
@@ -47,6 +51,7 @@ from nanotron.trainer import DistributedTrainer
 from nanotron.training_manager_nanotron import NanotronULFMTrainingManager
 from nanotron.logging import log_memory
 from nanotron.optim.clip_grads import clip_grad_norm
+from nanotron.serialize.optimizer import state_dict_to_device
 
 from ulfm_collectives.failure_simulator import FailureSimulator, set_failure_simulator
 
@@ -211,6 +216,15 @@ class ULFMDistributedTrainer(DistributedTrainer):
             self.optimizer,
         )
 
+        # Move optimizer states to GPU on the first step of a checkpoint-resume run.
+        # Must happen before optimizer.step() which is called inside after_pipeline().
+        if (
+            self.init_checkpoint_path is not None
+            and self.config.checkpoints.load_optimizer
+            and self.iteration_step == self.initial_iter_step
+        ):
+            state_dict_to_device(self.optimizer.state_dict(), "cuda")
+
         # Step 8: ULFM restore + optimizer (returns False on failure iteration)
         if self.ulfm_manager is not None:
             stepped = self.ulfm_manager.after_pipeline(self.optimizer)
@@ -232,8 +246,9 @@ class ULFMDistributedTrainer(DistributedTrainer):
         # LR scheduler advances only on successful optimizer steps
         self.lr_scheduler.step()
 
-        # Loss average across DP (dp_pg is repaired after ULFM hook; safe to use)
-        outputs = list(outputs)
+        # Loss average across DP (dp_pg is repaired after ULFM hook; safe to use).
+        # TODO: overlap this all_reduce with the optimizer step (currently runs sequentially;
+        # the parent hides latency by starting the async all_reduce before optimizer.step()).
         if outputs and isinstance(outputs[0]["loss"], torch.Tensor):
             loss_avg = torch.stack([out["loss"] for out in outputs]).sum()
             handle = dist.all_reduce(
