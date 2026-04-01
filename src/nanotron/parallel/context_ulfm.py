@@ -7,7 +7,6 @@ The DP process group inherits the ULFM default backend so the ULFM comm hook
 can intercept gradient allreduces for fault-tolerant DP training.
 """
 
-import os
 from typing import Optional
 
 import numpy as np
@@ -56,7 +55,7 @@ class ULFMParallelContext(ParallelContext):
         dp_pg is created without a backend argument so it inherits ULFM.
         """
         dist.barrier()
-        world_size = int(os.environ["WORLD_SIZE"])
+        world_size = dist.get_world_size()
         ranks = np.arange(0, world_size).reshape(
             (
                 self.expert_parallel_size,
