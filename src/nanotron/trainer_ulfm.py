@@ -20,19 +20,11 @@ nanotron profiling tools will not capture ULFM runs. TODO: add profiler support.
 """
 
 import gc
-import os
-import sys
 import time
 from typing import Dict, Iterable, Iterator, Optional, Tuple, Union
 
 import torch
 from torch.nn.parallel import DistributedDataParallel
-
-# ULFM modules live one directory above the nanotron package root
-# trainer_ulfm.py is in nanotron/src/nanotron/ → 3 up → mpi_ulfm_extension/
-_ULFM_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-if _ULFM_ROOT not in sys.path:
-    sys.path.insert(0, _ULFM_ROOT)
 
 from nanotron import distributed as dist
 from nanotron import logging as nanotron_logging

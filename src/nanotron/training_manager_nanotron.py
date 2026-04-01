@@ -16,14 +16,6 @@ unchanged from ULFMTrainingManager. This class only changes:
 """
 
 import logging
-import sys
-import os
-
-# ULFM modules live three directories above training_manager_nanotron.py
-# (nanotron/src/nanotron/ → 3 up → mpi_ulfm_extension/)
-_ULFM_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-if _ULFM_ROOT not in sys.path:
-    sys.path.insert(0, _ULFM_ROOT)
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel

@@ -10,7 +10,7 @@ mpirun -np 4 python run_train_ulfm.py --config-file examples/config_tiny_llama.y
 ULFM requires OpenMPI 5.0.8+ at /home/ziyueliu/openmpi-5.0.8-install.
 """
 
-import argparse, os, sys
+import argparse
 from typing import Dict, cast
 
 import numpy as np
@@ -41,11 +41,6 @@ from nanotron.trainer import DistributedTrainer
 from nanotron.trainer_ulfm import ULFMDistributedTrainer
 from nanotron.utils import main_rank_first, get_args
 from torch.utils.data import DataLoader
-
-# ULFM modules are one directory above this file (mpi_ulfm_extension/)
-_ULFM_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if _ULFM_ROOT not in sys.path:
-    sys.path.insert(0, _ULFM_ROOT)
 
 from ulfm_collectives.failure_simulator import FailureSimulator
 
