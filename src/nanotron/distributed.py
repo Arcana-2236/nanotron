@@ -280,12 +280,29 @@ def initialize_torch_distributed():
 def initialize_torch_distributed_ulfm():
     """Initialize torch.distributed with the ULFM (MPI) backend.
 
-    MPI provides rank/world_size via env vars set by mpirun; no MASTER_PORT needed.
-    Must be called before any other dist operations.
+    Requires MASTER_ADDR and MASTER_PORT to be set (e.g. via the launch command),
+    because NCCL subgroup creation needs a TCPStore that implements set()/get().
+    The MPI-internal store doesn't provide these, so we create a TCPStore explicitly
+    and pass it to init_process_group.
+
+    Launch example:
+        MASTER_ADDR=localhost MASTER_PORT=29500 mpirun -np N python run_train_ulfm.py
     """
-    # MPI backend reads rank/world_size from MPI internals (set by mpirun).
-    # We only need local_rank to pin the GPU before init.
+    rank = int(os.getenv("OMPI_COMM_WORLD_RANK", os.getenv("RANK", "0")))
+    world_size = int(os.getenv("OMPI_COMM_WORLD_SIZE", os.getenv("WORLD_SIZE", "1")))
     local_rank = int(os.getenv("OMPI_COMM_WORLD_LOCAL_RANK", os.getenv("LOCAL_RANK", "0")))
     torch.cuda.set_device(torch.cuda.device(local_rank))
-    dist.init_process_group(backend="ulfm")
+
+    master_addr = os.getenv("MASTER_ADDR", "localhost")
+    master_port = int(os.getenv("MASTER_PORT", "29500"))
+
+    store = dist.TCPStore(
+        host_name=master_addr,
+        port=master_port,
+        world_size=world_size,
+        is_master=(rank == 0),
+        timeout=dist.default_pg_timeout,
+    )
+
+    dist.init_process_group(backend="ulfm", store=store, rank=rank, world_size=world_size)
     return True

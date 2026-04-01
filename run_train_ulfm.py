@@ -4,8 +4,9 @@ Nanotron training script with ULFM fault-tolerant data parallelism.
 Usage:
 ```
 export CUDA_DEVICE_MAX_CONNECTIONS=1 # important for some distributed operations
-mpirun -np 4 python run_train_ulfm.py --config-file examples/config_tiny_llama.yaml
+MASTER_ADDR=localhost MASTER_PORT=29500 mpirun -np 4 python run_train_ulfm.py --config-file examples/config_tiny_llama.yaml
 ```
+MASTER_ADDR and MASTER_PORT are required: they back the TCPStore used by NCCL subgroup creation.
 
 ULFM requires OpenMPI 5.0.8+ at /home/ziyueliu/openmpi-5.0.8-install.
 """
@@ -489,9 +490,9 @@ if __name__ == "__main__":
     # once the distributed process group is set up; no manual initialize() call needed here.
     failure_sim = FailureSimulator(
         seed=42,
-        desired_failures=1,
+        desired_failures=0,
         total_minibatches=config.tokens.train_steps,
-        target_ranks={1},       # kill DP replica rank 1
+        target_ranks={},       # kill DP replica rank 1
         config_path=None,
         start_minibatch=10,     # let training stabilize before injecting failure
     )
