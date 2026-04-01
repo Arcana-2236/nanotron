@@ -7,8 +7,6 @@ The DP process group inherits the ULFM default backend so the ULFM comm hook
 can intercept gradient allreduces for fault-tolerant DP training.
 """
 
-from typing import Optional
-
 import numpy as np
 
 import nanotron.distributed as dist

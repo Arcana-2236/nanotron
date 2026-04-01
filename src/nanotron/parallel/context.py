@@ -20,7 +20,9 @@ class ParallelContext:
     ):
         """Initialize parallel context."""
         num_gpus_per_model = tensor_parallel_size * pipeline_parallel_size * expert_parallel_size
-        world_size = int(os.environ["WORLD_SIZE"])
+        # ULFM: dist is already initialized before super().__init__ is called, so
+        # WORLD_SIZE env var may not be set. Fall back to dist.get_world_size() when available.
+        world_size = dist.get_world_size() if dist.is_initialized() else int(os.environ["WORLD_SIZE"])
 
         assert (
             world_size % data_parallel_size == 0
@@ -56,7 +58,7 @@ class ParallelContext:
         if not dist.is_initialized():
             dist.initialize_torch_distributed()
 
-        world_size = int(os.getenv("WORLD_SIZE", "1"))
+        world_size = dist.get_world_size()
         ranks = list(range(world_size))
         process_group = dist.new_group(
             ranks=ranks,
@@ -69,7 +71,7 @@ class ParallelContext:
     def _init_parallel_groups(self):
         """Initialize 3D parallelism's all process groups."""
         dist.barrier()
-        world_size = int(os.environ["WORLD_SIZE"])
+        world_size = dist.get_world_size()
         ranks = np.arange(0, world_size).reshape(
             (
                 self.expert_parallel_size,
@@ -103,7 +105,7 @@ class ParallelContext:
 
     def create_new_group(self, all_groups_ranks: np.ndarray, backend: Optional[str] = None) -> dist.ProcessGroup:
         dist.barrier()
-        rank = int(os.environ["RANK"])
+        rank = dist.get_rank()
         new_group_containing_rank = None
         for group_ranks in all_groups_ranks:
             sorted_ranks = tuple(sorted(group_ranks))
