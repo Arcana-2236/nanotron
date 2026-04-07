@@ -282,16 +282,20 @@ def initialize_torch_distributed_ulfm():
 
     Requires MASTER_ADDR and MASTER_PORT to be set (e.g. via the launch command),
     because NCCL subgroup creation needs a TCPStore that implements set()/get().
-    The MPI-internal store doesn't provide these, so we create a TCPStore explicitly
-    and pass it to init_process_group.
+
+    PyTorch hardcodes a Store() placeholder for the ULFM backend at
+    distributed_c10d.py:1735, silently ignoring any store= argument.
+    We work around this by monkey-patching _world.pg_map after init to replace the
+    placeholder with the real TCPStore, so NCCL new_group() calls can exchange
+    ncclUniqueIds via store.set()/get().
 
     Launch example:
         MASTER_ADDR=localhost MASTER_PORT=29500 mpirun -np N python run_train_ulfm.py
     """
-    rank = int(os.getenv("OMPI_COMM_WORLD_RANK", os.getenv("RANK", "0")))
-    world_size = int(os.getenv("OMPI_COMM_WORLD_SIZE", os.getenv("WORLD_SIZE", "1")))
+    rank       = int(os.getenv("OMPI_COMM_WORLD_RANK",       os.getenv("RANK",       "0")))
+    world_size = int(os.getenv("OMPI_COMM_WORLD_SIZE",       os.getenv("WORLD_SIZE", "1")))
     local_rank = int(os.getenv("OMPI_COMM_WORLD_LOCAL_RANK", os.getenv("LOCAL_RANK", "0")))
-    torch.cuda.set_device(torch.cuda.device(local_rank))
+    torch.cuda.set_device(local_rank)
 
     master_addr = os.getenv("MASTER_ADDR", "localhost")
     master_port = int(os.getenv("MASTER_PORT", "29500"))
@@ -304,5 +308,14 @@ def initialize_torch_distributed_ulfm():
         timeout=dist.default_pg_timeout,
     )
 
-    dist.init_process_group(backend="ulfm", store=store, rank=rank, world_size=world_size)
+    dist.init_process_group(backend="ulfm", rank=rank, world_size=world_size)
+
+    # Monkey-patch: replace the Store() placeholder PyTorch hardcodes for ULFM
+    # with the real TCPStore, so subsequent new_group(backend="nccl") calls
+    # can call store.set()/get() for ncclUniqueId exchange.
+    import torch.distributed.distributed_c10d as _c10d
+    _default_pg = _c10d._get_default_group()
+    _backend_str, _ = _c10d._world.pg_map[_default_pg]
+    _c10d._world.pg_map[_default_pg] = (_backend_str, store)
+
     return True

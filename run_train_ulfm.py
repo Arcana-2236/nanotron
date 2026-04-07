@@ -43,6 +43,7 @@ from nanotron.trainer_ulfm import ULFMDistributedTrainer
 from nanotron.utils import main_rank_first, get_args
 from torch.utils.data import DataLoader
 
+from ulfm_collectives import set_ulfm_verbose_logging
 from ulfm_collectives.failure_simulator import FailureSimulator
 
 try:
@@ -483,6 +484,13 @@ if __name__ == "__main__":
         from nanotron.config.config import apply_generic_overrides
         config = apply_generic_overrides(config, args.override)
 
+    # Enable verbose ULFM backend logging if requested
+    if args.ulfm_verbose:
+        set_ulfm_verbose_logging(True)
+        import logging as _logging
+        _logging.getLogger("ulfm_collectives").setLevel(_logging.DEBUG)
+        _logging.basicConfig(level=_logging.WARNING)  # ensure handler exists
+
     # ULFM: inject failure simulator for fault-tolerance testing.
     # Kills DP rank 1 once at step 10 to exercise recovery.
     # Set desired_failures=0 (or remove failure_sim entirely) for production runs.
@@ -490,9 +498,9 @@ if __name__ == "__main__":
     # once the distributed process group is set up; no manual initialize() call needed here.
     failure_sim = FailureSimulator(
         seed=42,
-        desired_failures=0,
-        total_minibatches=config.tokens.train_steps,
-        target_ranks={},       # kill DP replica rank 1
+        desired_failures=1,
+        total_minibatches=20,
+        target_ranks={4},       # kill DP replica rank 1
         config_path=None,
         start_minibatch=10,     # let training stabilize before injecting failure
     )

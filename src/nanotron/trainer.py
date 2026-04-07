@@ -850,7 +850,7 @@ class DistributedTrainer:
         loss_avg: Optional[torch.Tensor],
     ) -> None:
         # TODO @nouamanetazi: Megatron-LM seems to be using a barrier to report their interval time. Check if this is necessary. https://github.com/NouamaneTazi/Megatron-LM/blob/e241a96c3085b18e36c6cee1d68a8155de77b5a6/megatron/training.py#L607
-        dist.barrier()
+        # dist.barrier()
         torch.cuda.synchronize()
         elapsed_time_per_iteration_ms = (time.time() - self.iteration_start_time) * 1000
         tokens_per_sec = (
@@ -886,8 +886,8 @@ class DistributedTrainer:
                 LogItem("hardware_tflops_per_gpu", hardware_tflops, "human_format"),  # , ".2f"),
             ]
 
-            if self.config.optimizer.clip_grad is not None:
-                log_entries.append(LogItem("grad_norm", self.grad_norm_unclipped.item(), "human_format"))  # , ".3f"))
+            # if self.config.optimizer.clip_grad is not None:
+            #     log_entries.append(LogItem("grad_norm", self.grad_norm_unclipped.item(), "human_format"))  # , ".3f"))
 
             # Log not too often the memory
             if self.iteration_step < 5 or (self.iteration_step - 1) % self.config.checkpoints.checkpoint_interval == 0:
@@ -907,13 +907,13 @@ class DistributedTrainer:
                 )
 
             # NOTE: only one rank writes to wandb
-            if dist.get_rank(self.parallel_context.world_pg) == self.logger_ranks[0] and wandb is not None:
-                wandb.log(
-                    {
-                        **{log_item.tag: log_item.scalar_value for log_item in log_entries},
-                        "iteration_step": self.iteration_step,
-                    }
-                )
+            # if dist.get_rank(self.parallel_context.world_pg) == self.logger_ranks[0] and wandb is not None:
+            #     wandb.log(
+            #         {
+            #             **{log_item.tag: log_item.scalar_value for log_item in log_entries},
+            #             "iteration_step": self.iteration_step,
+            #         }
+            #     )
 
             self.loggerwriter.add_scalars_from_list(log_entries, self.iteration_step)
 

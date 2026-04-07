@@ -160,7 +160,7 @@ class NanotronULFMTrainingManager(ULFMTrainingManager):
                 f"(n_microbatches={n_microbatches}, policy_accum={n_microbatches}). "
                 "Skipping optimizer step."
             )
-            optimizer.zero_grad(set_to_none=False)
+            optimizer.zero_grad()
             self.txn.mark_iteration_end()
             self._micro_in_window = 0
             return False
@@ -176,7 +176,7 @@ class NanotronULFMTrainingManager(ULFMTrainingManager):
                 f"[Rank {self.txn._rank}] NON_BLOCKING restore at policy boundary — "
                 "skipping optimizer step (full boundary support deferred)."
             )
-            optimizer.zero_grad(set_to_none=False)
+            optimizer.zero_grad()
             self.txn.mark_iteration_end()
             self._micro_in_window = 0
             return False
@@ -196,7 +196,7 @@ class NanotronULFMTrainingManager(ULFMTrainingManager):
                 p.grad.div_(div_factor)
 
         optimizer.step()
-        optimizer.zero_grad(set_to_none=False)
+        optimizer.zero_grad()
 
         self._on_step_committed()   # txn.after_successful_commit(): advance policy, reset epoch state
         self._micro_in_window = 0

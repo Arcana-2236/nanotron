@@ -1,3 +1,4 @@
+import datetime
 import os
 from typing import Literal, Optional, Tuple, Annotated
 
@@ -103,7 +104,12 @@ class ParallelContext:
 
         self.world_rank_matrix: np.ndarray = ranks
 
-    def create_new_group(self, all_groups_ranks: np.ndarray, backend: Optional[str] = None) -> dist.ProcessGroup:
+    def create_new_group(
+        self,
+        all_groups_ranks: np.ndarray,
+        backend: Optional[str] = None,
+        timeout: Optional[datetime.timedelta] = None,
+    ) -> dist.ProcessGroup:
         dist.barrier()
         rank = dist.get_rank()
         new_group_containing_rank = None
@@ -112,7 +118,10 @@ class ParallelContext:
 
             # add new group to `world_ranks_to_pg`
             if sorted_ranks not in self.world_ranks_to_pg:
-                new_group = dist.new_group(ranks=group_ranks, backend=backend)
+                kwargs = {}
+                if timeout is not None:
+                    kwargs["timeout"] = timeout
+                new_group = dist.new_group(ranks=group_ranks, backend=backend, **kwargs)
                 self.world_ranks_to_pg[sorted_ranks] = new_group
             else:
                 new_group = self.world_ranks_to_pg[sorted_ranks]
@@ -123,13 +132,14 @@ class ParallelContext:
         return new_group_containing_rank
 
     def set_device(self):
-        local_rank = int(os.getenv("LOCAL_RANK", "0"))
+        # MPI sets OMPI_COMM_WORLD_LOCAL_RANK; torchrun sets LOCAL_RANK.
+        local_rank = int(os.getenv("OMPI_COMM_WORLD_LOCAL_RANK", os.getenv("LOCAL_RANK", "0")))
 
         # NOTE: Set the device id.
         # `torch.cuda.device_count` should return the number of device on a single node.
         # We assume the nodes to be homogeneous (same number of gpus per node)
         device_id = local_rank
-        torch.cuda.set_device(torch.cuda.device(device_id))
+        torch.cuda.set_device(device_id)
 
     def get_local_ranks(self, world_rank: int) -> Tuple[int, int, int]:
         return tuple(i.item() for i in np.where(self.world_rank_matrix == world_rank))

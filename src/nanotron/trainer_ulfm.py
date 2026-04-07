@@ -45,6 +45,7 @@ from nanotron.logging import log_memory
 from nanotron.optim.clip_grads import clip_grad_norm
 from nanotron.serialize.optimizer import state_dict_to_device
 
+import ulfm_collectives as ULFM
 from ulfm_collectives.failure_simulator import FailureSimulator, set_failure_simulator
 
 logger = nanotron_logging.get_logger(__name__)
@@ -155,6 +156,17 @@ class ULFMDistributedTrainer(DistributedTrainer):
         if self.iteration_step < self.initial_iter_step + 5:
             log_memory(logger=logger)
 
+        # Global sync: ULFM consensus on world_pg ensures all surviving ranks
+        # are at the same iteration boundary before entering forward/backward.
+        # Prevents NCCL timeouts from timing mismatches across replicas when
+        # some ranks advance faster than others after a failure recovery.
+        # Pure sync point — does not consult policy or update restore_mode.
+        if self.ulfm_manager is not None:
+            ulfm_opts = ULFM.ULFMOptions(auto_repair=True)
+            logger.debug("Entering the global ULFM consensus barrier")
+            work = self.parallel_context.world_pg.consensus(ulfm_opts)
+            work.wait()
+
         # Step 2: ULFM pre-backward setup
         if self.ulfm_manager is not None:
             self.ulfm_manager.prepare_iteration(
@@ -180,25 +192,25 @@ class ULFMDistributedTrainer(DistributedTrainer):
         )
 
         # Step 5: tied weights gradient sync (NCCL groups; not affected by DP failure)
-        sync_tied_weights_gradients(
-            module=self.unwrapped_model,
-            parallel_context=self.parallel_context,
-            grad_accumulator=self.grad_accumulator,
-        )
+        # sync_tied_weights_gradients(
+        #     module=self.unwrapped_model,
+        #     parallel_context=self.parallel_context,
+        #     grad_accumulator=self.grad_accumulator,
+        # )
 
         # Step 6: gradient clipping
-        if self.config.optimizer.clip_grad is not None:
-            named_parameters = [
-                (name, param)
-                for name, param in self.unwrapped_model.get_named_params_with_correct_tied()
-                if param.requires_grad
-            ]
-            self.grad_norm_unclipped = clip_grad_norm(
-                mp_pg=self.parallel_context.mp_pg,
-                named_parameters=named_parameters,
-                grad_accumulator=self.grad_accumulator,
-                max_norm=self.config.optimizer.clip_grad,
-            )
+        # if self.config.optimizer.clip_grad is not None:
+        #     named_parameters = [
+        #         (name, param)
+        #         for name, param in self.unwrapped_model.get_named_params_with_correct_tied()
+        #         if param.requires_grad
+        #     ]
+        #     self.grad_norm_unclipped = clip_grad_norm(
+        #         mp_pg=self.parallel_context.mp_pg,
+        #         named_parameters=named_parameters,
+        #         grad_accumulator=self.grad_accumulator,
+        #         max_norm=self.config.optimizer.clip_grad,
+        #     )
 
         before_optim_step_sanity_checks(
             self.config,
@@ -216,6 +228,19 @@ class ULFMDistributedTrainer(DistributedTrainer):
             and self.iteration_step == self.initial_iter_step
         ):
             state_dict_to_device(self.optimizer.state_dict(), "cuda")
+
+        # Replica-consistency gate: NCCL barrier on mp_pg ensures the entire
+        # failed replica dies together (via NCCL watchdog), then ULFM consensus
+        # on dp_pg blocks until dead ranks are detected by MPI, updates the
+        # orchestrator's restore_plan via handle_work_completion so all surviving
+        # ranks in the same replica arrive at the same restore_mode.
+        if self.ulfm_manager is not None and self.parallel_context.data_parallel_size > 1:
+            mp_pg = self.parallel_context.mp_pg
+            if dist.get_world_size(mp_pg) > 1:
+                logger.debug(f"[Rank {dist.get_rank(self.parallel_context.world_pg)}] Entering replica barrier")
+                dist.barrier(group=mp_pg, device_ids=[torch.cuda.current_device()])
+            logger.debug(f"[Rank {dist.get_rank(self.parallel_context.world_pg)}] Entering ULFM consensus barrier")
+            self.ulfm_manager._on_consensus_step()
 
         # Step 8: ULFM restore + optimizer (returns False on failure iteration)
         if self.ulfm_manager is not None:
@@ -243,13 +268,14 @@ class ULFMDistributedTrainer(DistributedTrainer):
         # the parent hides latency by starting the async all_reduce before optimizer.step()).
         if outputs and isinstance(outputs[0]["loss"], torch.Tensor):
             loss_avg = torch.stack([out["loss"] for out in outputs]).sum()
-            handle = dist.all_reduce(
+            handle = dist.ulfm_all_reduce(
                 loss_avg,
                 group=self.parallel_context.dp_pg,
                 async_op=True,
-                op=dist.ReduceOp.AVG,
+                op=dist.ReduceOp.SUM,
             )
             handle.wait()
+            loss_avg.div_(self.parallel_context.dp_pg.current_size())
         else:
             loss_avg = None
 
@@ -258,7 +284,42 @@ class ULFMDistributedTrainer(DistributedTrainer):
         return outputs, loss_avg
 
     # ------------------------------------------------------------------
-    # Override 4: train() — tick failure simulator; skip failed iterations
+    # Override 4: ULFM-safe logging
+    # ------------------------------------------------------------------
+
+    def _is_log_rank(self) -> bool:
+        """Check dynamically if this rank should log, using dp_pg.current_rank()
+        instead of the static dp_rank from the world_rank_matrix."""
+        my_global_rank = dist.get_rank(self.parallel_context.world_pg)
+        ep_rank, pp_rank, _, tp_rank = self.parallel_context.get_local_ranks(my_global_rank)
+        return (
+            ep_rank == 0
+            and pp_rank == self.unwrapped_model.output_pp_rank
+            and tp_rank == 0
+            and self.parallel_context.dp_pg.current_rank() == 0
+        )
+
+    def train_step_logs(self, outputs, loss_avg):
+        """Override parent to use dp_pg.current_rank() for the log-rank check.
+
+        After ULFM recovery the original dp_rank=0 may be dead. We dynamically
+        resolve the logger rank so the surviving dp leader prints logs and
+        reports to wandb.
+        """
+        import numpy as np
+
+        if self._is_log_rank():
+            my_global_rank = dist.get_rank(self.parallel_context.world_pg)
+            self.logger_ranks = np.array([my_global_rank])
+            if self.loggerwriter is None:
+                self.loggerwriter = self.setup_log_writers()
+        else:
+            self.logger_ranks = np.array([])
+
+        super().train_step_logs(outputs=outputs, loss_avg=loss_avg)
+
+    # ------------------------------------------------------------------
+    # Override 5: train() — tick failure simulator; skip failed iterations
     # ------------------------------------------------------------------
 
     def train(

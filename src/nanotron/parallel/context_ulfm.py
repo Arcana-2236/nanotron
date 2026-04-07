@@ -7,6 +7,9 @@ The DP process group inherits the ULFM default backend so the ULFM comm hook
 can intercept gradient allreduces for fault-tolerant DP training.
 """
 
+import datetime
+import os
+
 import numpy as np
 
 import nanotron.distributed as dist
@@ -51,6 +54,9 @@ class ULFMParallelContext(ParallelContext):
         """
         Same layout as parent but TP/PP/EP/MP groups use explicit NCCL backend.
         dp_pg is created without a backend argument so it inherits ULFM.
+
+        Set NCCL_PG_TIMEOUT_SECONDS env var to shorten NCCL watchdog timeout for
+        testing (e.g. NCCL_PG_TIMEOUT_SECONDS=10).  Default: PyTorch's default (30 min).
         """
         dist.barrier()
         world_size = dist.get_world_size()
@@ -64,10 +70,18 @@ class ULFMParallelContext(ParallelContext):
         )
         self.world_ranks_to_pg = {}
 
+        _timeout_sec = os.getenv("NCCL_PG_TIMEOUT_SECONDS")
+        _nccl_timeout = (
+            datetime.timedelta(seconds=float(_timeout_sec))
+            if _timeout_sec is not None
+            else None
+        )
+
         # TP: NCCL (intra-replica, no failure expected)
         self.tp_pg = self.create_new_group(
             ranks.transpose((0, 1, 2, 3)).reshape((-1, self.tensor_parallel_size)),
             backend="nccl",
+            timeout=_nccl_timeout,
         )
         # DP: ULFM (cross-replica, needs fault tolerance) — no backend → inherits ULFM
         self.dp_pg = self.create_new_group(
@@ -78,16 +92,27 @@ class ULFMParallelContext(ParallelContext):
         self.pp_pg = self.create_new_group(
             ranks.transpose((2, 3, 0, 1)).reshape((-1, self.pipeline_parallel_size)),
             backend="nccl",
+            timeout=_nccl_timeout,
         )
         # Expert: NCCL
         self.expert_pg = self.create_new_group(
             ranks.transpose((1, 2, 3, 0)).reshape((-1, self.expert_parallel_size)),
             backend="nccl",
+            timeout=_nccl_timeout,
         )
         # Model parallel (TP+PP+EP for a given DP rank): NCCL
+        # Longer timeout than other NCCL groups: surviving replicas must wait
+        # for NCCL watchdog + MPI failure detection before DP partners arrive.
+        _mp_timeout_sec = os.getenv("NCCL_MP_TIMEOUT_SECONDS")
+        _mp_timeout = (
+            datetime.timedelta(seconds=float(_mp_timeout_sec))
+            if _mp_timeout_sec is not None
+            else _nccl_timeout
+        )
         self.mp_pg = self.create_new_group(
             [ranks[:, :, dp_rank, :].reshape(-1) for dp_rank in range(self.data_parallel_size)],
             backend="nccl",
+            timeout=_mp_timeout,
         )
         # TP+Expert combined: NCCL
         self.tp_and_expert_pg = self.create_new_group(
@@ -97,5 +122,6 @@ class ULFMParallelContext(ParallelContext):
                 for dp_rank in range(self.data_parallel_size)
             ],
             backend="nccl",
+            timeout=_nccl_timeout,
         )
         self.world_rank_matrix: np.ndarray = ranks

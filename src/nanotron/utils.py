@@ -296,6 +296,14 @@ def get_args():
         help="Override pp (parallelism.pp)",
     )
 
+    # ULFM options
+    parser.add_argument(
+        "--ulfm-verbose",
+        action="store_true",
+        default=False,
+        help="Enable verbose debug logging in the ULFM backend",
+    )
+
     # Generic dotted-path overrides (e.g. --override optimizer.optimizer_factory.muon_mode=sgd)
     parser.add_argument(
         "--override",
