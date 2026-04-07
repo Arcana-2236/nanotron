@@ -5,9 +5,9 @@ ULFMDistributedTrainer: Nanotron DistributedTrainer with ULFM fault-tolerant DP.
 Changes from parent:
   - _create_parallel_context(): returns ULFMParallelContext (ULFM dp_pg, NCCL tp/pp/ep)
   - init_model(): after parent builds DDP model, creates NanotronULFMTrainingManager
-    which registers the ULFM comm hook on the existing DDP model
-  - training_step(): calls prepare_iteration()/after_pipeline() around pipeline engine;
-    skips optimizer/lr-scheduler on failure iterations
+    which registers a deferred ULFM comm hook on the existing DDP model
+  - training_step(): calls prepare_iteration()/fire_deferred_allreduces()/after_pipeline()
+    around pipeline engine; skips optimizer/lr-scheduler on failure iterations
   - train(): calls failure_simulator.begin_minibatch() each step; skips
     logging/checkpoint when training_step signals a failure iteration
 
@@ -41,6 +41,12 @@ from nanotron.sanity_checks import (
 )
 from nanotron.trainer import DistributedTrainer
 from nanotron.training_manager_nanotron import NanotronULFMTrainingManager
+from nanotron.parallel.pipeline_parallel.engine import (
+    OneForwardOneBackwardPipelineEngine,
+)
+from nanotron.parallel.pipeline_parallel.engine_ulfm import (
+    ULFMOneForwardOneBackwardPipelineEngine,
+)
 from nanotron.logging import log_memory
 from nanotron.optim.clip_grads import clip_grad_norm
 from nanotron.serialize.optimizer import state_dict_to_device
@@ -191,6 +197,10 @@ class ULFMDistributedTrainer(DistributedTrainer):
             self.config, self.parallel_context, self.unwrapped_model, self.grad_accumulator
         )
 
+        # Fire deferred ULFM gradient allreduces (post-pipeline, all TP partners synchronized)
+        if self.ulfm_manager is not None and self.parallel_context.data_parallel_size > 1:
+            self.ulfm_manager.fire_deferred_allreduces()
+
         # Step 5: tied weights gradient sync (NCCL groups; not affected by DP failure)
         # sync_tied_weights_gradients(
         #     module=self.unwrapped_model,
@@ -338,7 +348,14 @@ class ULFMDistributedTrainer(DistributedTrainer):
         if self.config.checkpoints.save_initial_state and self.init_checkpoint_path is None:
             self.save_checkpoint()
 
-        self.pipeline_engine = self.config.parallelism.pp_engine
+        # Use ULFM pipeline engine: no_sync on early microbatches, DDP hooks fire
+        # on the last microbatch (deferred hook captures snapshots, returns instantly).
+        # Actual ULFM allreduces are fired post-pipeline via fire_deferred_allreduces().
+        base_engine = self.config.parallelism.pp_engine
+        if isinstance(base_engine, OneForwardOneBackwardPipelineEngine):
+            self.pipeline_engine = ULFMOneForwardOneBackwardPipelineEngine()
+        else:
+            self.pipeline_engine = base_engine
         self.pipeline_engine.nb_microbatches = self.n_micro_batches_per_batch
 
         self.unwrapped_model = (

@@ -499,7 +499,7 @@ if __name__ == "__main__":
     failure_sim = FailureSimulator(
         seed=42,
         desired_failures=1,
-        total_minibatches=20,
+        total_minibatches=10,
         target_ranks={4},       # kill DP replica rank 1
         config_path=None,
         start_minibatch=10,     # let training stabilize before injecting failure

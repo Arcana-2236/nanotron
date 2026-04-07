@@ -88,11 +88,21 @@ class ULFMParallelContext(ParallelContext):
             ranks.transpose((3, 0, 1, 2)).reshape((-1, self.data_parallel_size)),
             backend=None,
         )
-        # PP: NCCL (intra-replica pipeline, no failure expected)
+        # PP: NCCL (cross-replica pipeline stages)
+        # Longer timeout: when a rank in the other replica dies, the surviving
+        # replica's PP partner must wait for finalize_backward (blocked on MPI
+        # futures) before sending pipeline grads.  Use NCCL_PP_TIMEOUT_SECONDS
+        # to give it enough headroom; falls back to NCCL_PG_TIMEOUT_SECONDS.
+        _pp_timeout_sec = os.getenv("NCCL_PP_TIMEOUT_SECONDS")
+        _pp_timeout = (
+            datetime.timedelta(seconds=float(_pp_timeout_sec))
+            if _pp_timeout_sec is not None
+            else _nccl_timeout
+        )
         self.pp_pg = self.create_new_group(
             ranks.transpose((2, 3, 0, 1)).reshape((-1, self.pipeline_parallel_size)),
             backend="nccl",
-            timeout=_nccl_timeout,
+            timeout=_pp_timeout,
         )
         # Expert: NCCL
         self.expert_pg = self.create_new_group(
