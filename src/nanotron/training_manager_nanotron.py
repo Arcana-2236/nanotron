@@ -3,19 +3,17 @@
 NanotronULFMTrainingManager: Adapts ULFMTrainingManager for nanotron's
 pipeline-engine-based training loop.
 
-Gradient sync strategy: DEFERRED PER-BUCKET ALLREDUCE (no DDP hooks).
-  - The pipeline engine always uses no_sync() so DDP's reducer never fires.
-  - At init, we compute the same bucket assignment DDP would use, giving us
-    per-bucket parameter groups.
-  - After the pipeline completes, fire_deferred_allreduces() flattens each
-    bucket's gradients into a contiguous buffer, snapshots it, allreduces
-    via ULFM, and scatters the reduced values back to param.grad.
+Gradient sync strategy: DEFERRED PER-BUCKET ALLREDUCE via DDP comm hook.
+  - The pipeline engine uses no_sync() on early microbatches and
+    ddp_trigger_sync_in_bwd() on the last microbatch.
+  - On the last microbatch, DDP hooks fire per-bucket. Our deferred hook
+    snapshots each bucket and returns a pre-resolved Future (no blocking).
+  - After the pipeline completes, fire_deferred_allreduces() triggers the
+    actual ULFM allreduces per-bucket via the orchestrator.
   - Per-bucket failure handling through the orchestrator's handle_work_completion.
 """
 
-import contextlib
 import logging
-from typing import List
 
 import torch
 import torch.distributed as dist
@@ -25,37 +23,8 @@ import ulfm_collectives as ULFM
 from ulfm_collectives.training_manager import ULFMTrainingManager
 from ulfm_collectives.orchestrator import StepTxnOrchestrator
 from ulfm_collectives.policy import create_policy, GradRestoreMode
-from ulfm_collectives.failure_simulator import get_failure_simulator
 
 logger = logging.getLogger(__name__)
-
-
-def _build_bucket_groups(
-    ddp_model: DistributedDataParallel,
-) -> List[List[torch.nn.Parameter]]:
-    """
-    Build parameter bucket groups matching DDP's bucket assignment.
-
-    Returns a list of buckets, each containing the parameters in that bucket.
-    """
-    params = [p for p in ddp_model.parameters() if p.requires_grad]
-    if not params:
-        return []
-
-    bucket_cap = ddp_model.bucket_bytes_cap
-    bucket_size_limits = [bucket_cap]
-    if getattr(ddp_model, "bucket_bytes_cap_default", False):
-        bucket_size_limits = [dist._DEFAULT_FIRST_BUCKET_BYTES, bucket_cap]
-
-    expect_sparse = [False] * len(params)
-    bucket_indices, _ = dist._compute_bucket_assignment_by_size(
-        params, bucket_size_limits, expect_sparse
-    )
-
-    buckets = []
-    for indices in bucket_indices:
-        buckets.append([params[i] for i in indices])
-    return buckets
 
 
 class NanotronULFMTrainingManager(ULFMTrainingManager):
@@ -65,7 +34,7 @@ class NanotronULFMTrainingManager(ULFMTrainingManager):
     Usage pattern in ULFMDistributedTrainer.training_step():
 
         self.ulfm_manager.prepare_iteration(...)
-        outputs = self.pipeline_engine.train_batch_iter(...)  # always no_sync
+        outputs = self.pipeline_engine.train_batch_iter(...)
         # ... mp_pg barrier + dp_pg consensus ...
         self.ulfm_manager.fire_deferred_allreduces()   # post-pipeline grad sync
         stepped = self.ulfm_manager.after_pipeline(optimizer)
@@ -105,17 +74,24 @@ class NanotronULFMTrainingManager(ULFMTrainingManager):
         )
 
         self.ddp_model = ddp_model
-
-        # Build bucket groups matching DDP's bucket assignment.
-        self._bucket_groups = _build_bucket_groups(ddp_model)
-
         self._micro_in_window = 0
+
+        # Register deferred comm hook — snapshots + queues per-bucket,
+        # returns pre-resolved Futures so finalize_backward never blocks.
+        self._register_deferred_hook(ulfm_opts)
 
         logger.debug(
             f"[Rank {rank}] NanotronULFMTrainingManager initialized "
-            f"({len(self._bucket_groups)} buckets): "
+            f"(deferred hook registered): "
             f"policy={policy_type}, grad_accum={grad_accum_steps}"
         )
+
+    def _register_deferred_hook(self, ulfm_opts):
+        from ulfm_collectives.ulfm_hook import create_ulfm_deferred_hook, HookState
+
+        hstate = HookState(pg=self.process_group, orchestrator=self.txn)
+        hook = create_ulfm_deferred_hook(ulfm_opts=ulfm_opts)
+        self.ddp_model.register_comm_hook(state=hstate, hook=hook)
 
     # ------------------------------------------------------------------
     # Nanotron lifecycle interface
@@ -135,51 +111,10 @@ class NanotronULFMTrainingManager(ULFMTrainingManager):
         """
         Post-pipeline per-bucket ULFM gradient allreduce.
 
-        For each bucket: flatten grads → snapshot → allreduce → scatter back.
-        Per-bucket failure handling via handle_work_completion().
+        Delegates to the orchestrator which fires the actual ULFM allreduces
+        for each bucket that was queued by the deferred hook.
         """
-        if not self._bucket_groups:
-            return
-
-        torch.cuda.synchronize()
-
-        opts = torch.distributed.AllreduceOptions()
-        opts.reduceOp = torch.distributed.ReduceOp.SUM
-        ulfm_opts = self.txn.ulfm_opts
-
-        for bucket_index, bucket_params in enumerate(self._bucket_groups):
-            grads = [p.grad for p in bucket_params if p.grad is not None]
-            if not grads:
-                continue
-
-            # Flatten into contiguous buffer
-            flat = torch._utils._flatten_dense_tensors(grads)
-
-            # Snapshot for restoration on failure
-            self.txn.on_bucket_snapshot(flat, bucket_index, self.txn.dp_pg)
-
-            # ULFM allreduce (in-place on flat buffer)
-            work = self.txn.dp_pg.ulfm_allreduce([flat], opts=opts, ulfm_opts=ulfm_opts)
-            work.wait()
-
-            # Failure injection + work completion handling
-            _sim = get_failure_simulator()
-            ctx = (
-                _sim.may_fail_here("post-allreduce")
-                if _sim is not None
-                else contextlib.nullcontext()
-            )
-            with ctx:
-                self.txn.handle_work_completion(work, bucket_index=bucket_index)
-
-            self.txn.increment_hook_counter()
-
-            # Scatter reduced values back to param.grad
-            for param, unflat in zip(
-                [p for p in bucket_params if p.grad is not None],
-                torch._utils._unflatten_dense_tensors(flat, grads),
-            ):
-                param.grad.copy_(unflat)
+        self.txn.fire_deferred_allreduces()
 
     def after_pipeline(self, optimizer) -> bool:
         """

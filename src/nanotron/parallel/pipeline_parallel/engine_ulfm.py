@@ -1,9 +1,12 @@
 """
-ULFM pipeline engines: always-no_sync for deferred gradient sync.
+ULFM pipeline engines with deferred gradient sync.
 
-DDP hooks never fire during the pipeline. Gradients accumulate locally
-across all microbatches. After the pipeline completes, the training
-manager allreduces gradients per-bucket via ULFM.
+Early microbatches (0..N-2): model.no_sync() suppresses DDP hooks.
+Last microbatch (N-1): ddp_trigger_sync_in_bwd() enables DDP hooks so
+the deferred comm hook fires per-bucket, snapshots gradients, and returns
+a pre-resolved Future (finalize_backward never blocks).
+
+Actual ULFM allreduces are fired post-pipeline by the training manager.
 """
 
 from typing import Optional
@@ -11,6 +14,7 @@ from typing import Optional
 from torch.nn.parallel import DistributedDataParallel
 
 from nanotron.optim.gradient_accumulator import GradientAccumulator
+from nanotron.parallel.data_parallel.utils import ddp_trigger_sync_in_bwd
 from nanotron.parallel.pipeline_parallel.engine import (
     AllForwardAllBackwardPipelineEngine,
     OneForwardOneBackwardPipelineEngine,
@@ -20,10 +24,11 @@ from torch import nn as torch_nn
 
 
 class ULFMOneForwardOneBackwardPipelineEngine(OneForwardOneBackwardPipelineEngine):
-    """1F1B pipeline engine that always suppresses DDP gradient sync.
+    """1F1B pipeline engine with deferred ULFM gradient sync.
 
-    All microbatches use model.no_sync() so DDP hooks never fire and
-    finalize_backward never blocks on MPI futures.
+    Early microbatches use model.no_sync() so DDP hooks never fire.
+    Last microbatch uses ddp_trigger_sync_in_bwd() so the deferred hook
+    captures per-bucket snapshots and returns pre-resolved Futures.
     """
 
     def _get_bwd_context(
@@ -38,14 +43,18 @@ class ULFMOneForwardOneBackwardPipelineEngine(OneForwardOneBackwardPipelineEngin
         is_ddp = isinstance(model, DistributedDataParallel)
         context_list = []
         if is_ddp:
-            context_list.append(model.no_sync())
-            if grad_accumulator is not None and nb_backwards < self.nb_microbatches - 1:
-                context_list.append(grad_accumulator.no_sync())
+            if nb_backwards < self.nb_microbatches - 1:
+                context_list.append(model.no_sync())
+                if grad_accumulator is not None:
+                    context_list.append(grad_accumulator.no_sync())
+            else:
+                # Last microbatch: DDP hooks fire → deferred hook snapshots + queues
+                context_list.append(ddp_trigger_sync_in_bwd(model_ddp=model))
         return ContextManagers(context_list)
 
 
 class ULFMAllForwardAllBackwardPipelineEngine(AllForwardAllBackwardPipelineEngine):
-    """AFAB pipeline engine that always suppresses DDP gradient sync."""
+    """AFAB pipeline engine with deferred ULFM gradient sync."""
 
     def _get_bwd_context(
         self,
@@ -59,7 +68,11 @@ class ULFMAllForwardAllBackwardPipelineEngine(AllForwardAllBackwardPipelineEngin
         is_ddp = isinstance(model, DistributedDataParallel)
         context_list = []
         if is_ddp:
-            context_list.append(model.no_sync())
-            if grad_accumulator is not None and nb_backwards < self.nb_microbatches - 1:
-                context_list.append(grad_accumulator.no_sync())
+            if nb_backwards < self.nb_microbatches - 1:
+                context_list.append(model.no_sync())
+                if grad_accumulator is not None:
+                    context_list.append(grad_accumulator.no_sync())
+            else:
+                # Last microbatch: DDP hooks fire → deferred hook snapshots + queues
+                context_list.append(ddp_trigger_sync_in_bwd(model_ddp=model))
         return ContextManagers(context_list)
