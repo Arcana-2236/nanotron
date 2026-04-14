@@ -21,6 +21,9 @@ nanotron profiling tools will not capture ULFM runs. TODO: add profiler support.
 
 import gc
 import time
+import shutil
+import os
+import wandb
 from typing import Dict, Iterable, Iterator, Optional, Tuple, Union
 
 import torch
@@ -46,7 +49,14 @@ from nanotron.parallel.pipeline_parallel.engine import (
 from nanotron.parallel.pipeline_parallel.engine_ulfm import (
     ULFMOneForwardOneBackwardPipelineEngine,
 )
-from nanotron.logging import log_memory
+from nanotron.logging import (
+    LogItem,
+    log_memory,
+    log_rank,
+)
+from nanotron.helpers import (
+    log_throughput,
+)
 from nanotron.optim.clip_grads import clip_grad_norm
 from nanotron.parallel.tied_parameters import sync_tied_weights_gradients
 from nanotron.serialize.optimizer import state_dict_to_device
@@ -412,7 +422,87 @@ class ULFMDistributedTrainer(DistributedTrainer):
         else:
             self.logger_ranks = np.array([])
 
-        super().train_step_logs(outputs=outputs, loss_avg=loss_avg)
+        torch.cuda.synchronize()
+        elapsed_time_per_iteration_ms = (time.time() - self.iteration_start_time) * 1000
+        tokens_per_sec = (
+            self.global_batch_size * self.sequence_length / (elapsed_time_per_iteration_ms / 1000)
+        )  # tokens_per_sec is calculated using sequence_length
+        model_tflops, hardware_tflops = self.unwrapped_model.get_flops_per_sec(
+            iteration_time_in_sec=elapsed_time_per_iteration_ms / 1000,
+            sequence_length=self.sequence_length,
+            global_batch_size=self.global_batch_size,
+        )
+
+        if dist.get_rank(self.parallel_context.world_pg) in self.logger_ranks:
+            assert self.loggerwriter is not None, "loggerwriter should be defined on logger ranks"
+
+            lr = self.lr_scheduler.get_last_lr()[0]
+
+            log_entries = [
+                # LogItem("consumed_samples", self.consumed_train_samples, "human_format"),  # , "12d"),
+                LogItem(
+                    "consumed_tokens",
+                    self.metadata.consumed_train_samples * self.config.tokens.sequence_length,
+                    "human_format",
+                ),  # , "12d"),
+                LogItem("elapsed_time_per_iteration_ms", elapsed_time_per_iteration_ms, "human_format"),  # , ".1f"),
+                LogItem("tokens_per_sec", tokens_per_sec, "human_format"),  # , "1.6E"),
+                LogItem(
+                    "tokens_per_sec_per_gpu", tokens_per_sec / self.parallel_context.world_pg.current_size(), "human_format"
+                ),  # , "1.6E"),
+                LogItem("global_batch_size", self.global_batch_size, "human_format"),  # , "5d"),
+                LogItem("lm_loss", loss_avg.item(), "human_format"),  # , "1.6E"),
+                LogItem("lr", lr, "human_format"),  # , ".3E"),
+                LogItem("model_tflops_per_gpu", model_tflops, "human_format"),  # , ".2f"),
+                LogItem("hardware_tflops_per_gpu", hardware_tflops, "human_format"),  # , ".2f"),
+            ]
+
+            if self.config.optimizer.clip_grad is not None:
+                log_entries.append(LogItem("grad_norm", self.grad_norm_unclipped.item(), "human_format"))  # , ".3f"))
+
+            # Log not too often the memory
+            if self.iteration_step < 5 or (self.iteration_step - 1) % self.config.checkpoints.checkpoint_interval == 0:
+                total, used, free = shutil.disk_usage("/")
+                log_entries.extend(
+                    [
+                        LogItem(
+                            "cuda_memory_allocated", torch.cuda.memory_allocated(), "human_format"
+                        ),  #  / 1024**2, ".2f"),
+                        LogItem(
+                            "cuda_max_memory_reserved", torch.cuda.max_memory_reserved(), "human_format"
+                        ),  #  / 1024**2, ".2f"),
+                        LogItem("hd_total_memory_tb", total, "human_format"),  #  / (2**40), ".2f"),
+                        LogItem("hd_used_memory_tb", used, "human_format"),  #  / (2**40), ".2f"),
+                        LogItem("hd_free_memory_tb", free, "human_format"),  #  / (2**40), ".2f"),
+                    ]
+                )
+
+            # NOTE: only one rank writes to wandb
+            if dist.get_rank(self.parallel_context.world_pg) == self.logger_ranks[0] and wandb is not None:
+                wandb.log(
+                    {
+                        **{log_item.tag: log_item.scalar_value for log_item in log_entries},
+                        "iteration_step": self.iteration_step,
+                    },
+                    step=self.iteration_step,
+                )
+
+            self.loggerwriter.add_scalars_from_list(log_entries, self.iteration_step)
+
+        # Nanotron Benchmark mode: we log the throughput and exit
+        if os.environ.get("NANOTRON_BENCHMARK", "0") == "1" and self.iteration_step == 3:
+            log_throughput(
+                self.config,
+                self.parallel_context,
+                model_tflops,
+                hardware_tflops,
+                tokens_per_sec,
+            )
+            log_rank("Throughput logging complete", logger=logger, level=nanotron_logging.INFO)
+            if "SLURM_JOB_ID" in os.environ:
+                os.system("scancel " + os.environ["SLURM_JOB_ID"])
+            else:
+                exit(0)
 
     # ------------------------------------------------------------------
     # Override 5: train() — dynamic workload + failure handling
