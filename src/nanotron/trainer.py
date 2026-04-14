@@ -886,8 +886,8 @@ class DistributedTrainer:
                 LogItem("hardware_tflops_per_gpu", hardware_tflops, "human_format"),  # , ".2f"),
             ]
 
-            # if self.config.optimizer.clip_grad is not None:
-            #     log_entries.append(LogItem("grad_norm", self.grad_norm_unclipped.item(), "human_format"))  # , ".3f"))
+            if self.config.optimizer.clip_grad is not None:
+                log_entries.append(LogItem("grad_norm", self.grad_norm_unclipped.item(), "human_format"))  # , ".3f"))
 
             # Log not too often the memory
             if self.iteration_step < 5 or (self.iteration_step - 1) % self.config.checkpoints.checkpoint_interval == 0:
@@ -907,13 +907,14 @@ class DistributedTrainer:
                 )
 
             # NOTE: only one rank writes to wandb
-            # if dist.get_rank(self.parallel_context.world_pg) == self.logger_ranks[0] and wandb is not None:
-            #     wandb.log(
-            #         {
-            #             **{log_item.tag: log_item.scalar_value for log_item in log_entries},
-            #             "iteration_step": self.iteration_step,
-            #         }
-            #     )
+            if dist.get_rank(self.parallel_context.world_pg) == self.logger_ranks[0] and wandb is not None:
+                wandb.log(
+                    {
+                        **{log_item.tag: log_item.scalar_value for log_item in log_entries},
+                        "iteration_step": self.iteration_step,
+                    },
+                    step=self.iteration_step,
+                )
 
             self.loggerwriter.add_scalars_from_list(log_entries, self.iteration_step)
 
@@ -966,7 +967,8 @@ class DistributedTrainer:
                         "val_loss": val_loss.item(),
                         "val_perplexity": val_perplexity.item(),
                         "iteration_step": self.iteration_step,
-                    }
+                    },
+                    step=self.iteration_step,
                 )
 
             # Log to TensorBoard via LoggerWriter
