@@ -292,23 +292,49 @@ def initialize_torch_distributed_ulfm():
     Launch example:
         MASTER_ADDR=localhost MASTER_PORT=29500 mpirun -np N python run_train_ulfm.py
     """
-    rank       = int(os.getenv("OMPI_COMM_WORLD_RANK",       os.getenv("RANK",       "0")))
-    world_size = int(os.getenv("OMPI_COMM_WORLD_SIZE",       os.getenv("WORLD_SIZE", "1")))
+    dist.init_process_group(backend="ulfm")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    # rank       = int(os.getenv("OMPI_COMM_WORLD_RANK",       os.getenv("RANK",       "0")))
+    # world_size = int(os.getenv("OMPI_COMM_WORLD_SIZE",       os.getenv("WORLD_SIZE", "1")))
     local_rank = int(os.getenv("OMPI_COMM_WORLD_LOCAL_RANK", os.getenv("LOCAL_RANK", "0")))
     torch.cuda.set_device(local_rank)
 
     master_addr = os.getenv("MASTER_ADDR", "localhost")
     master_port = int(os.getenv("MASTER_PORT", "29500"))
 
-    store = dist.TCPStore(
-        host_name=master_addr,
-        port=master_port,
-        world_size=world_size,
-        is_master=(rank == 0),
-        timeout=dist.default_pg_timeout,
-    )
-
-    dist.init_process_group(backend="ulfm", rank=rank, world_size=world_size)
+    # Avoid thundering herd: after init_process_group (an MPI collective), all
+    # ranks are tightly synchronized and would blast TCP connections at rank 0
+    # simultaneously, overwhelming the TCP listen backlog.  Instead:
+    #   1. Rank 0 starts the server with wait_for_workers=False (returns immediately)
+    #   2. MPI barrier ensures the server is up before workers connect
+    #   3. Workers connect (still bursty, but the server is already accepting)
+    #   4. Final MPI barrier ensures all workers are connected before proceeding
+    if rank == 0:
+        print(f"[Rank {rank}] Starting TCP store server at {master_addr}:{master_port}")
+        store = dist.TCPStore(
+            host_name=master_addr,
+            port=master_port,
+            world_size=world_size,
+            is_master=True,
+            timeout=dist.default_pg_timeout,
+            wait_for_workers=False,
+        )
+    print(f"[Rank {rank}] Entering pre-TCP barrier")
+    dist.barrier()  # ensure server is listening before workers connect
+    print(f"[Rank {rank}] Leaving pre-TCP barrier")
+    if rank != 0:
+        print(f"[Rank {rank}] Connecting to TCP store server at {master_addr}:{master_port}")
+        store = dist.TCPStore(
+            host_name=master_addr,
+            port=master_port,
+            world_size=world_size,
+            is_master=False,
+            timeout=dist.default_pg_timeout,
+        )
+    print(f"[Rank {rank}] Entering post-TCP barrier")
+    dist.barrier()  # ensure all workers connected before proceeding
+    print(f"[Rank {rank}] Leaving post-TCP barrier")
 
     # Monkey-patch: replace the Store() placeholder PyTorch hardcodes for ULFM
     # with the real TCPStore, so subsequent new_group(backend="nccl") calls
