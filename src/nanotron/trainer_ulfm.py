@@ -215,13 +215,6 @@ class ULFMDistributedTrainer(DistributedTrainer):
         if self.iteration_step < self.initial_iter_step + 5:
             log_memory(logger=logger)
 
-        # Global sync: ULFM consensus on world_pg
-        if self.ulfm_manager is not None:
-            ulfm_opts = ULFM.ULFMOptions(auto_repair=True)
-            logger.debug("Entering the global ULFM consensus barrier")
-            work = self.parallel_context.world_pg.consensus(ulfm_opts)
-            work.wait()
-
         is_first_pass = True
         all_outputs = []
 
@@ -241,6 +234,11 @@ class ULFMDistributedTrainer(DistributedTrainer):
                     n_microbatches=n_micro,
                     is_first_pass=is_first_pass
                 )
+                # Global sync: ULFM consensus on world_pg
+                ulfm_opts = ULFM.ULFMOptions(auto_repair=True)
+                logger.debug("Entering the global ULFM consensus barrier")
+                work = self.parallel_context.world_pg.consensus(ulfm_opts)
+                work.wait()
 
             # --- Wire pre_last_backward_fn (only for extended passes) ---
             # Waits for async gradient restore before last microbatch backward.
