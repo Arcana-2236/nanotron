@@ -195,9 +195,17 @@ class NanotronULFMTrainingManager(ULFMTrainingManager):
     # Actions (called by the training_step loop)
     # ------------------------------------------------------------------
 
-    def start_blocking_restore(self):
-        """Blocking gradient restoration with re-reduction (retries internally)."""
-        self._start_restore_gradients_blocking()
+    def start_blocking_restore(self, allow_internal_retry: bool = True):
+        """Blocking gradient restoration with re-reduction.
+
+        Args:
+            allow_internal_retry: If True, orchestrator retries re-reductions
+                internally until success or policy boundary. Pass False when
+                the caller cross-synchronizes DP groups after this call, so
+                all ranks take the same outer-loop path on re-reduction
+                failure (see orchestrator.restore_gradients_blocking).
+        """
+        self._start_restore_gradients_blocking(allow_internal_retry=allow_internal_retry)
 
     def start_nonblocking_restore(self):
         """Start async gradient restoration (overlaps with next forward pass)."""

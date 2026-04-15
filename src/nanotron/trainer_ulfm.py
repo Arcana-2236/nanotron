@@ -290,29 +290,7 @@ class ULFMDistributedTrainer(DistributedTrainer):
             if restore_mode == GradRestoreMode.SKIP:
                 # No failure — proceed to optimizer step
                 break
-
-            if restore_mode == GradRestoreMode.BLOCKING:
-                # Non-boundary failure: blocking restore with re-reduce
-                # (retries internally if re-reduction fails)
-                logger.info(
-                    f"[Rank {dist.get_rank(self.parallel_context.world_pg)}] "
-                    "BLOCKING gradient restore before optimizer step"
-                )
-                self.ulfm_manager.start_blocking_restore()
-
-                # Check if blocking restore retries crossed a policy boundary
-                if self.ulfm_manager.is_at_policy_boundary():
-                    logger.warning(
-                        f"[Rank {dist.get_rank(self.parallel_context.world_pg)}] "
-                        "Crossed policy boundary during blocking restore — "
-                        "starting non-blocking restore for extra microbatches"
-                    )
-                    self.ulfm_manager.start_nonblocking_restore()
-                    continue  # Loop back for extra microbatches
-                else:
-                    # Restored successfully without crossing boundary
-                    break
-
+            
             if restore_mode == GradRestoreMode.NON_BLOCKING:
                 # Policy boundary: start async restore, loop for extra microbatches
                 n_extra = self.ulfm_manager.get_n_extra_microbatches()
@@ -323,6 +301,54 @@ class ULFMDistributedTrainer(DistributedTrainer):
                 )
                 self.ulfm_manager.start_nonblocking_restore()
                 continue  # Loop back for extra microbatches
+
+            while restore_mode == GradRestoreMode.BLOCKING:
+                # Non-boundary failure: blocking restore with re-reduce.
+                # Disable internal retry — we cross-synchronize DP groups
+                # below via the replica barrier + ULFM DP barrier, so any
+                # re-reduction failure must return here so every rank makes
+                # the same outer-loop decision (otherwise early-discoverer
+                # ranks retry to success and set SKIP while late-discoverer
+                # ranks re-enter BLOCKING alone, deadlocking the next
+                # collective — MPI has no timeout).
+                logger.warning(
+                    f"[Rank {dist.get_rank(self.parallel_context.world_pg)}] "
+                    "BLOCKING gradient restore before optimizer step"
+                )
+                self.ulfm_manager.start_blocking_restore(allow_internal_retry=False)
+
+                # If failure happened during the re-reduce, some ranks in the failed replica may survived
+                # and other ranks in healthy replica may have incosistent views from the one directly involved with the failure
+                # The additional replica barrier kills the survivors in the failed replica,
+                # and ensures all ranks in a healthy replica have consistent views before proceeding.
+                if self.ulfm_manager is not None and self.parallel_context.data_parallel_size > 1:
+                    mp_pg = self.parallel_context.mp_pg
+                    if dist.get_world_size(mp_pg) > 1:
+                        dist.barrier(group=mp_pg, device_ids=[torch.cuda.current_device()])
+                    self.ulfm_manager.on_consensus_step()
+
+                # Check if blocking restore retries crossed a policy boundary
+                if self.ulfm_manager.is_at_policy_boundary():
+                    logger.warning(
+                        f"[Rank {dist.get_rank(self.parallel_context.world_pg)}] "
+                        "Crossed policy boundary during blocking restore — "
+                        "starting non-blocking restore for extra microbatches"
+                    )
+                    self.ulfm_manager.start_nonblocking_restore()
+                    break  # Loop back for extra microbatches
+                elif restore_mode == GradRestoreMode.BLOCKING:
+                    # Still on the same boundary after blocking restore + re-reduce: proceed to optimizer step
+                    logger.warning(
+                        f"[Rank {dist.get_rank(self.parallel_context.world_pg)}] "
+                        "Failure happend during re-reduction, but not crossing policy boundary, retrying."
+                    )
+                    continue
+            else:
+                logger.warning(
+                    f"[Rank {dist.get_rank(self.parallel_context.world_pg)}] "
+                    "Restored successfully without crossing policy boundary — proceeding to optimizer step"
+                )
+                break
 
         # --- Post-loop: sync tied weights, clip grads, optimizer step ---
 
