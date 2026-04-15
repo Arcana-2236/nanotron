@@ -73,12 +73,19 @@ class _ULFMEngineMixin:
         if not isinstance(output, dict):
             output = {"loss": output}
         
+        # Call should_zero_loss_fn on every PP stage — it has the side effect
+        # of incrementing dp_pg.contributed_, which must fire on all ranks
+        # (not just the last PP stage) so the global SUM over contributed_
+        # is accurate. Only the last PP stage has a real loss tensor to zero.
+        should_zero = False
+        if self.should_zero_loss_fn is not None:
+            should_zero = self.should_zero_loss_fn()
+
         if not isinstance(output["loss"], TensorPointer):
-            if self.should_zero_loss_fn is not None and self.should_zero_loss_fn():
+            if should_zero:
                 output["loss"] = output["loss"] * 0.0
-        
-        if not isinstance(output["loss"], TensorPointer) and output["loss"].requires_grad:
-            state.register_activation_requiring_backward(output["loss"])
+            if output["loss"].requires_grad:
+                state.register_activation_requiring_backward(output["loss"])
         return output
 
     def validate_batch_iter(
