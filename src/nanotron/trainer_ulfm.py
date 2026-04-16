@@ -283,13 +283,11 @@ class ULFMDistributedTrainer(DistributedTrainer):
             if self.ulfm_manager is None:
                 break  # Single-GPU: no recovery needed
 
-            restore_mode = self.ulfm_manager.get_restore_mode()
-
-            if restore_mode == GradRestoreMode.SKIP:
+            if self.ulfm_manager.get_restore_mode() == GradRestoreMode.SKIP:
                 # No failure — proceed to optimizer step
                 break
             
-            if restore_mode == GradRestoreMode.NON_BLOCKING:
+            if self.ulfm_manager.get_restore_mode() == GradRestoreMode.NON_BLOCKING:
                 # Policy boundary: start async restore, loop for extra microbatches
                 n_extra = self.ulfm_manager.get_n_extra_microbatches()
                 logger.warning(
@@ -300,7 +298,8 @@ class ULFMDistributedTrainer(DistributedTrainer):
                 self.ulfm_manager.start_nonblocking_restore()
                 continue  # Loop back for extra microbatches
 
-            while restore_mode == GradRestoreMode.BLOCKING:
+            blocking_restore_attempt = 0
+            while self.ulfm_manager.get_restore_mode() == GradRestoreMode.BLOCKING:
                 # Non-boundary failure: blocking restore with re-reduce.
                 # Disable internal retry — we cross-synchronize DP groups
                 # below via the replica barrier + ULFM DP barrier, so any
@@ -314,12 +313,18 @@ class ULFMDistributedTrainer(DistributedTrainer):
                     "BLOCKING gradient restore before optimizer step"
                 )
                 self.ulfm_manager.start_blocking_restore(allow_internal_retry=False)
+                blocking_restore_attempt += 1
 
                 # If failure happened during the re-reduce, some ranks in the failed replica may survived
                 # and other ranks in healthy replica may have incosistent views from the one directly involved with the failure
                 # The additional replica barrier kills the survivors in the failed replica,
                 # and ensures all ranks in a healthy replica have consistent views before proceeding.
                 if self.ulfm_manager is not None and self.parallel_context.data_parallel_size > 1:
+                    ulfm_opts = ULFM.ULFMOptions(auto_repair=True)
+                    logger.debug("Entering the global ULFM consensus barrier")
+                    work = self.parallel_context.world_pg.consensus(ulfm_opts)
+                    work.wait()
+
                     mp_pg = self.parallel_context.mp_pg
                     if dist.get_world_size(mp_pg) > 1:
                         dist.barrier(group=mp_pg, device_ids=[torch.cuda.current_device()])
@@ -334,13 +339,19 @@ class ULFMDistributedTrainer(DistributedTrainer):
                     )
                     self.ulfm_manager.start_nonblocking_restore()
                     break  # Loop back for extra microbatches
-                elif restore_mode == GradRestoreMode.BLOCKING:
+                elif self.ulfm_manager.get_restore_mode() == GradRestoreMode.BLOCKING:
                     # Still on the same boundary after blocking restore + re-reduce: proceed to optimizer step
                     logger.warning(
                         f"[Rank {dist.get_rank(self.parallel_context.world_pg)}] "
                         "Failure happend during re-reduction, but not crossing policy boundary, retrying."
                     )
-                    continue
+                    if blocking_restore_attempt <= 3:
+                        continue
+                    else:
+                        raise RuntimeError(
+                            f"[Rank {dist.get_rank(self.parallel_context.world_pg)}] "
+                            "Re-attempt of blocking restoration has reached limit, abort."
+                        )
             else:
                 logger.warning(
                     f"[Rank {dist.get_rank(self.parallel_context.world_pg)}] "
@@ -387,6 +398,23 @@ class ULFMDistributedTrainer(DistributedTrainer):
         ):
             state_dict_to_device(self.optimizer.state_dict(), "cuda")
 
+        # Loss average across DP
+        if all_outputs and isinstance(all_outputs[0]["loss"], torch.Tensor):
+            loss_stacked = torch.stack([out["loss"] for out in all_outputs])
+            print(f"[Rank {dist.get_rank(self.parallel_context.world_pg)}] Local loss: {loss_stacked}")
+            loss_avg = torch.stack([out["loss"] for out in all_outputs]).sum()
+            handle = dist.ulfm_all_reduce(
+                loss_avg,
+                group=self.parallel_context.dp_pg,
+                async_op=True,
+                op=dist.ReduceOp.SUM,
+            )
+            handle.wait()
+            print(f"[Rank {dist.get_rank(self.parallel_context.world_pg)}] Reduced loss sum: {loss_avg}, div factor: {self.ulfm_manager._get_grad_div_factor()}")
+            loss_avg.div_(self.ulfm_manager._get_grad_div_factor())
+        else:
+            loss_avg = None
+
         if self.ulfm_manager is not None:
             self.ulfm_manager.normalize_and_step(self.optimizer)
         else:
@@ -399,20 +427,6 @@ class ULFMDistributedTrainer(DistributedTrainer):
 
         # LR scheduler advances only on successful optimizer steps
         self.lr_scheduler.step()
-
-        # Loss average across DP
-        if all_outputs and isinstance(all_outputs[0]["loss"], torch.Tensor):
-            loss_avg = torch.stack([out["loss"] for out in all_outputs]).sum()
-            handle = dist.ulfm_all_reduce(
-                loss_avg,
-                group=self.parallel_context.dp_pg,
-                async_op=True,
-                op=dist.ReduceOp.SUM,
-            )
-            handle.wait()
-            loss_avg.div_(self.ulfm_manager._get_grad_div_factor())
-        else:
-            loss_avg = None
 
         self.post_train_step()
 
