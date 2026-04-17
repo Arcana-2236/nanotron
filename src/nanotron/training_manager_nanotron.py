@@ -16,7 +16,7 @@ The trainer drives the loop — this manager exposes query/action methods
 that the training_step while-loop uses to decide what to do next:
   - get_restore_mode(), is_at_policy_boundary(), get_n_extra_microbatches()
   - start_blocking_restore(), start_nonblocking_restore(), wait_restore_before_backward()
-  - normalize_and_step(), on_consensus_step(), fire_deferred_allreduces()
+  - normalize_gradients(), optimizer_step(), on_consensus_step(), fire_deferred_allreduces()
 """
 
 import logging
@@ -223,8 +223,7 @@ class NanotronULFMTrainingManager(ULFMTrainingManager):
         """Prepare for gradient sync (set quiesce=False)."""
         self._on_grad_sync_step()
 
-    def normalize_and_step(self, optimizer):
-        """Normalize gradients, run optimizer.step(), commit, reset."""
+    def normalize_gradients(self):
         div_factor = self._get_grad_div_factor()
 
         if self._fp32_accumulator is not None:
@@ -239,6 +238,9 @@ class NanotronULFMTrainingManager(ULFMTrainingManager):
             for p in self.ddp_model.parameters():
                 if p.grad is not None:
                     p.grad.div_(div_factor)
+
+    def optimizer_step(self, optimizer):
+        """Normalize gradients, run optimizer.step(), commit, reset."""
 
         optimizer.step()
 

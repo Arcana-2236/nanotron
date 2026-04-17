@@ -368,6 +368,8 @@ class ULFMDistributedTrainer(DistributedTrainer):
             grad_accumulator=self.grad_accumulator,
         )
 
+        self.normalize_gradients()
+
         # Clip gradients
         if self.config.optimizer.clip_grad is not None:
             named_parameters = [
@@ -416,7 +418,7 @@ class ULFMDistributedTrainer(DistributedTrainer):
             loss_avg = None
 
         if self.ulfm_manager is not None:
-            self.ulfm_manager.normalize_and_step(self.optimizer)
+            self.ulfm_manager.optimizer_step(self.optimizer)
         else:
             self.optimizer.step()
             self.optimizer.zero_grad()
