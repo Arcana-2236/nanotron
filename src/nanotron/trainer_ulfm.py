@@ -368,7 +368,8 @@ class ULFMDistributedTrainer(DistributedTrainer):
             grad_accumulator=self.grad_accumulator,
         )
 
-        self.normalize_gradients()
+        if self.ulfm_manager is not None:
+            self.ulfm_manager.normalize_gradients()
 
         # Clip gradients
         if self.config.optimizer.clip_grad is not None:
