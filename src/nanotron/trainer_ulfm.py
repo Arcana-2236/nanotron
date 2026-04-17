@@ -403,8 +403,6 @@ class ULFMDistributedTrainer(DistributedTrainer):
 
         # Loss average across DP
         if all_outputs and isinstance(all_outputs[0]["loss"], torch.Tensor):
-            loss_stacked = torch.stack([out["loss"] for out in all_outputs])
-            print(f"[Rank {dist.get_rank(self.parallel_context.world_pg)}] Local loss: {loss_stacked}")
             loss_avg = torch.stack([out["loss"] for out in all_outputs]).sum()
             handle = dist.ulfm_all_reduce(
                 loss_avg,
@@ -413,7 +411,6 @@ class ULFMDistributedTrainer(DistributedTrainer):
                 op=dist.ReduceOp.SUM,
             )
             handle.wait()
-            print(f"[Rank {dist.get_rank(self.parallel_context.world_pg)}] Reduced loss sum: {loss_avg}, div factor: {self.ulfm_manager._get_grad_div_factor()}")
             loss_avg.div_(self.ulfm_manager._get_grad_div_factor())
         else:
             loss_avg = None
@@ -491,6 +488,7 @@ class ULFMDistributedTrainer(DistributedTrainer):
                 LogItem(
                     "tokens_per_sec_per_gpu", tokens_per_sec / self.parallel_context.world_pg.current_size(), "human_format"
                 ),  # , "1.6E"),
+                LogItem("total_gpus", self.parallel_context.world_pg.current_size(), "human_format"),  # , "5d"),
                 LogItem("global_batch_size", self.global_batch_size, "human_format"),  # , "5d"),
                 LogItem("lm_loss", loss_avg.item(), "human_format"),  # , "1.6E"),
                 LogItem("lr", lr, "human_format"),  # , ".3E"),
@@ -500,6 +498,23 @@ class ULFMDistributedTrainer(DistributedTrainer):
 
             if self.config.optimizer.clip_grad is not None:
                 log_entries.append(LogItem("grad_norm", self.grad_norm_unclipped.item(), "human_format"))  # , ".3f"))
+
+            if self.ulfm_manager is not None:
+                txn = self.ulfm_manager.txn
+                curr_grad_accum = txn.curr_grad_accum_steps
+                curr_dp_size = txn.curr_world_size
+                gbs = txn.effective_batch_size
+                total_workload = curr_dp_size * curr_grad_accum
+                redundancy = 1.0 - (gbs / total_workload) if total_workload > 0 else 0.0
+                log_entries.extend([
+                    LogItem("ulfm_num_majors", txn.num_major_procs, "human_format"),
+                    LogItem("ulfm_num_minors", txn.num_minor_procs, "human_format"),
+                    LogItem("ulfm_num_major_spares", txn.num_major_spare_procs, "human_format"),
+                    LogItem("ulfm_num_minor_spares", txn.num_minor_spare_procs, "human_format"),
+                    LogItem("ulfm_curr_grad_accum", curr_grad_accum, "human_format"),
+                    LogItem("ulfm_curr_minor_grad_accum", txn.minor_proc_grad_accum_steps, "human_format"),
+                    LogItem("ulfm_redundancy", redundancy, "human_format"),
+                ])
 
             # Log not too often the memory
             if self.iteration_step < 5 or (self.iteration_step - 1) % self.config.checkpoints.checkpoint_interval == 0:
