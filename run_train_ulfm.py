@@ -492,18 +492,28 @@ if __name__ == "__main__":
         _logging.basicConfig(level=_logging.WARNING)  # ensure handler exists
 
     # ULFM: inject failure simulator for fault-tolerance testing.
-    # Kills DP rank 1 once at step 10 to exercise recovery.
-    # Set desired_failures=0 (or remove failure_sim entirely) for production runs.
+    # Enabled only when --failure-sim-desired-failures > 0.
     # Note: FailureSimulator.initialize() is called inside ULFMDistributedTrainer.__init__
     # once the distributed process group is set up; no manual initialize() call needed here.
-    failure_sim = FailureSimulator(
-        seed=42,
-        desired_failures=1,
-        total_minibatches=10,
-        target_ranks={4},       # kill DP replica rank 1
-        config_path=None,
-        start_minibatch=10,     # let training stabilize before injecting failure
-    )
+    if args.failure_sim_desired_failures > 0:
+        target_ranks = None
+        if args.failure_sim_target_ranks:
+            target_ranks = {int(r) for r in args.failure_sim_target_ranks.split(",") if r.strip()}
+        total_minibatches = (
+            args.failure_sim_total_minibatches
+            if args.failure_sim_total_minibatches is not None
+            else config.tokens.train_steps
+        )
+        failure_sim = FailureSimulator(
+            seed=args.failure_sim_seed,
+            desired_failures=args.failure_sim_desired_failures,
+            total_minibatches=total_minibatches,
+            target_ranks=target_ranks,
+            config_path=args.failure_sim_config,
+            start_minibatch=args.failure_sim_start_minibatch,
+        )
+    else:
+        failure_sim = None
 
     trainer = ULFMDistributedTrainer(config, failure_simulator=failure_sim)
     dataloader = get_dataloader(trainer)

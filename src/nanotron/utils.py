@@ -304,6 +304,44 @@ def get_args():
         help="Enable verbose debug logging in the ULFM backend",
     )
 
+    # Failure simulator options (effective when desired-failures > 0)
+    parser.add_argument(
+        "--failure-sim-seed",
+        type=int,
+        default=42,
+        help="FailureSimulator random seed",
+    )
+    parser.add_argument(
+        "--failure-sim-desired-failures",
+        type=int,
+        default=0,
+        help="Expected total failures across all target ranks (0 disables the simulator)",
+    )
+    parser.add_argument(
+        "--failure-sim-total-minibatches",
+        type=int,
+        default=None,
+        help="Total minibatches for probability computation (defaults to tokens.train_steps)",
+    )
+    parser.add_argument(
+        "--failure-sim-target-ranks",
+        type=str,
+        default=None,
+        help="Comma-separated global ranks eligible for failure (default: all)",
+    )
+    parser.add_argument(
+        "--failure-sim-config",
+        type=str,
+        default=None,
+        help="Path to YAML config defining failure locations and weights",
+    )
+    parser.add_argument(
+        "--failure-sim-start-minibatch",
+        type=int,
+        default=1,
+        help="Minibatch index at which failure injection becomes active",
+    )
+
     # Generic dotted-path overrides (e.g. --override optimizer.optimizer_factory.muon_mode=sgd)
     parser.add_argument(
         "--override",
