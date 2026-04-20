@@ -304,42 +304,59 @@ def get_args():
         help="Enable verbose debug logging in the ULFM backend",
     )
 
-    # Failure simulator options (effective when desired-failures > 0)
+    # Failure simulator options (deterministic replica-aware schedule).
+    # Either load a pre-generated YAML via --failure-schedule, or generate
+    # inline with --failure-count + --failure-step-range + --failure-locations.
+    # The two sources are mutually exclusive. If neither is given, no failures
+    # are injected.
     parser.add_argument(
-        "--failure-sim-seed",
-        type=int,
-        default=42,
-        help="FailureSimulator random seed",
+        "--failure-schedule",
+        type=str,
+        default=None,
+        help="Path to a pre-generated failure schedule YAML "
+             "(see scripts/generate_failure_schedule.py).",
     )
     parser.add_argument(
-        "--failure-sim-desired-failures",
+        "--failure-count",
         type=int,
         default=0,
-        help="Expected total failures across all target ranks (0 disables the simulator)",
+        help="Inline generator: number of DP replicas to kill. 0 disables injection.",
     )
     parser.add_argument(
-        "--failure-sim-total-minibatches",
+        "--failure-seed",
         type=int,
-        default=None,
-        help="Total minibatches for probability computation (defaults to tokens.train_steps)",
+        default=42,
+        help="Inline generator seed (must be identical on every rank).",
     )
     parser.add_argument(
-        "--failure-sim-target-ranks",
-        type=str,
-        default=None,
-        help="Comma-separated global ranks eligible for failure (default: all)",
-    )
-    parser.add_argument(
-        "--failure-sim-config",
-        type=str,
-        default=None,
-        help="Path to YAML config defining failure locations and weights",
-    )
-    parser.add_argument(
-        "--failure-sim-start-minibatch",
+        "--failure-step-range",
         type=int,
-        default=1,
-        help="Minibatch index at which failure injection becomes active",
+        nargs=2,
+        default=None,
+        metavar=("START", "END"),
+        help="Inline generator: half-open [START, END) minibatch index range for kills.",
+    )
+    parser.add_argument(
+        "--failure-sampling",
+        choices=("iid", "stratified"),
+        default="stratified",
+        help="Inline generator: step sampling mode.",
+    )
+    parser.add_argument(
+        "--failure-locations",
+        nargs="+",
+        default=None,
+        metavar="NAME:WEIGHT",
+        help="Inline generator: location:weight pairs "
+             "(e.g. post-allreduce:0.6 backward:0.4).",
+    )
+    parser.add_argument(
+        "--failure-exclude-replicas",
+        type=str,
+        default="0",
+        help="Comma-separated DP replica ids to spare from selection "
+             "(default '0' spares the dp_rank=0 replica that hosts wandb). "
+             "Pass empty string to allow all replicas.",
     )
 
     # Generic dotted-path overrides (e.g. --override optimizer.optimizer_factory.muon_mode=sgd)

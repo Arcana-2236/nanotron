@@ -45,6 +45,11 @@ from torch.utils.data import DataLoader
 
 from ulfm_collectives import set_ulfm_verbose_logging
 from ulfm_collectives.failure_simulator import FailureSimulator
+from ulfm_collectives.failure import (
+    FailureSchedule,
+    ParallelismSpec,
+    generate as generate_failure_schedule,
+)
 
 try:
     from huggingface_hub import __version__ as hf_hub_version
@@ -492,28 +497,65 @@ if __name__ == "__main__":
         _logging.basicConfig(level=_logging.WARNING)  # ensure handler exists
 
     # ULFM: inject failure simulator for fault-tolerance testing.
-    # Enabled only when --failure-sim-desired-failures > 0.
+    # Either load a pre-generated schedule from --failure-schedule, or build
+    # one inline from --failure-count + --failure-step-range +
+    # --failure-locations. The two sources are mutually exclusive.
     # Note: FailureSimulator.initialize() is called inside ULFMDistributedTrainer.__init__
     # once the distributed process group is set up; no manual initialize() call needed here.
-    if args.failure_sim_desired_failures > 0:
-        target_ranks = None
-        if args.failure_sim_target_ranks:
-            target_ranks = {int(r) for r in args.failure_sim_target_ranks.split(",") if r.strip()}
-        total_minibatches = (
-            args.failure_sim_total_minibatches
-            if args.failure_sim_total_minibatches is not None
-            else config.tokens.train_steps
+    def _parse_exclude_replicas(s):
+        s = (s or "").strip()
+        if not s:
+            return []
+        return [int(x) for x in s.split(",") if x.strip()]
+
+    spec = ParallelismSpec(
+        kind="3d",
+        tp=config.parallelism.tp,
+        pp=config.parallelism.pp,
+        dp=config.parallelism.dp,
+        ep=config.parallelism.expert_parallel_size,
+    )
+
+    if args.failure_schedule and args.failure_count > 0:
+        raise ValueError(
+            "--failure-schedule and --failure-count are mutually exclusive; "
+            "pick one source for the failure schedule."
         )
-        failure_sim = FailureSimulator(
-            seed=args.failure_sim_seed,
-            desired_failures=args.failure_sim_desired_failures,
-            total_minibatches=total_minibatches,
-            target_ranks=target_ranks,
-            config_path=args.failure_sim_config,
-            start_minibatch=args.failure_sim_start_minibatch,
+
+    failure_sim = None
+    if args.failure_schedule:
+        schedule = FailureSchedule.load(args.failure_schedule)
+        schedule.assert_matches_topology(spec)
+        failure_sim = FailureSimulator(schedule=schedule)
+    elif args.failure_count > 0:
+        if args.failure_step_range is None:
+            raise ValueError(
+                "--failure-count > 0 requires --failure-step-range START END."
+            )
+        if not args.failure_locations:
+            raise ValueError(
+                "--failure-count > 0 requires --failure-locations NAME:WEIGHT ..."
+            )
+        location_weights = {}
+        for pair in args.failure_locations:
+            if ":" not in pair:
+                raise ValueError(
+                    f"--failure-locations entry {pair!r} must be NAME:WEIGHT."
+                )
+            name, weight = pair.rsplit(":", 1)
+            location_weights[name] = float(weight)
+
+        exclude_ids = _parse_exclude_replicas(args.failure_exclude_replicas)
+        schedule = generate_failure_schedule(
+            parallelism=spec,
+            seed=args.failure_seed,
+            num_failures=args.failure_count,
+            step_range=(args.failure_step_range[0], args.failure_step_range[1]),
+            location_weights=location_weights,
+            sampling=args.failure_sampling,
+            exclude_replica_ids=exclude_ids,
         )
-    else:
-        failure_sim = None
+        failure_sim = FailureSimulator(schedule=schedule)
 
     trainer = ULFMDistributedTrainer(config, failure_simulator=failure_sim)
     dataloader = get_dataloader(trainer)

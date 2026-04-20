@@ -21,15 +21,23 @@ CONFIG=${CONFIG:-"config_llama_7b_ulfm"}
 DP=${DP:-16}
 
 # --- Failure simulator env vars (unset → flag omitted → Python default) ---
-# FSIM_SEED, FSIM_DESIRED_FAILURES, FSIM_TOTAL_MINIBATCHES,
-# FSIM_TARGET_RANKS, FSIM_CONFIG, FSIM_START_MINIBATCH
+# Either point at a pre-generated schedule:
+#   FSIM_SCHEDULE=/path/to/schedule.yaml
+# Or drive the inline generator with:
+#   FSIM_COUNT        (int, 0 disables)
+#   FSIM_STEP_RANGE          ("START END", space-separated)
+#   FSIM_LOCATIONS           (space-separated NAME:WEIGHT pairs)
+#   FSIM_SEED                (int)
+#   FSIM_SAMPLING            ("stratified" | "iid")
+#   FSIM_EXCLUDE_REPLICAS    (comma-separated replica ids; default "0" spares wandb)
 FSIM_ARGS=()
-[[ -n "${FSIM_SEED:-}" ]]               && FSIM_ARGS+=(--failure-sim-seed "$FSIM_SEED")
-[[ -n "${FSIM_DESIRED_FAILURES:-}" ]]   && FSIM_ARGS+=(--failure-sim-desired-failures "$FSIM_DESIRED_FAILURES")
-[[ -n "${FSIM_TOTAL_MINIBATCHES:-}" ]]  && FSIM_ARGS+=(--failure-sim-total-minibatches "$FSIM_TOTAL_MINIBATCHES")
-[[ -n "${FSIM_TARGET_RANKS:-}" ]]       && FSIM_ARGS+=(--failure-sim-target-ranks "$FSIM_TARGET_RANKS")
-[[ -n "${FSIM_CONFIG:-}" ]]             && FSIM_ARGS+=(--failure-sim-config "$FSIM_CONFIG")
-[[ -n "${FSIM_START_MINIBATCH:-}" ]]    && FSIM_ARGS+=(--failure-sim-start-minibatch "$FSIM_START_MINIBATCH")
+[[ -n "${FSIM_SCHEDULE:-}" ]]          && FSIM_ARGS+=(--failure-schedule "$FSIM_SCHEDULE")
+[[ -n "${FSIM_COUNT:-}" ]]             && FSIM_ARGS+=(--failure-count "$FSIM_COUNT")
+[[ -n "${FSIM_STEP_RANGE:-}" ]]        && FSIM_ARGS+=(--failure-step-range ${FSIM_STEP_RANGE})
+[[ -n "${FSIM_LOCATIONS:-}" ]]         && FSIM_ARGS+=(--failure-locations ${FSIM_LOCATIONS})
+[[ -n "${FSIM_SEED:-}" ]]              && FSIM_ARGS+=(--failure-seed "$FSIM_SEED")
+[[ -n "${FSIM_SAMPLING:-}" ]]          && FSIM_ARGS+=(--failure-sampling "$FSIM_SAMPLING")
+[[ -n "${FSIM_EXCLUDE_REPLICAS:-}" ]]  && FSIM_ARGS+=(--failure-exclude-replicas "$FSIM_EXCLUDE_REPLICAS")
 
 # --- Run CoLA Nanotron ---
 LOGDIR="/eagle/TensorCompress/$USER/project/pytorch/mpi_ulfm_extension/nanotron/.logging/$(date +%Y%m%d)"

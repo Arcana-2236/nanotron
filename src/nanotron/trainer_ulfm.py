@@ -97,17 +97,10 @@ class ULFMDistributedTrainer(DistributedTrainer):
         # and register the appropriate hook (bf16 deferred or fp32 deferred).
         self._setup_ulfm_manager()
 
-        # Register failure simulator globally (ulfm_hook.py reads it via get_failure_simulator())
+        # Register failure simulator globally (ulfm_hook.py reads it via get_failure_simulator()).
+        # Replica exclusion (e.g. sparing dp_rank=0 that hosts wandb) is handled
+        # at schedule-generation time via --failure-exclude-replicas, not here.
         if self._failure_simulator is not None:
-            # Exclude dp_rank=0 replica to avoid killing the wandb logger
-            dp0_ranks = set(
-                self.parallel_context.get_global_rank(
-                    ep_rank=0, pp_rank=pp, dp_rank=0, tp_rank=tp
-                ).item()
-                for pp in range(self.parallel_context.pipeline_parallel_size)
-                for tp in range(self.parallel_context.tensor_parallel_size)
-            )
-            self._failure_simulator.excluded_ranks = dp0_ranks
             set_failure_simulator(self._failure_simulator)
             self._failure_simulator.initialize(
                 rank=dist.get_rank(self.parallel_context.world_pg),
