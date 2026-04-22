@@ -10,7 +10,13 @@ Actual ULFM allreduces are fired post-pipeline by the training manager.
 
 Callbacks (set by trainer for extended passes at policy boundaries):
   should_zero_loss_fn: Called per-forward; if True, loss *= 0 (rank shouldn't contribute)
-  pre_last_backward_fn: Called before last microbatch's backward (wait for async restore)
+  pre_first_backward_fn: Called before the first microbatch's backward. Used to
+      sync async gradient restoration (cross-stream wait on the restore event)
+      before any backward writes to the fp32/bf16 grad buffer. Must run before
+      micro 0, not last micro: early micros' `_accumulate_grad` already reads/
+      writes the buffer via `fp32_grad.add_(half_param.grad)` on the main stream,
+      which races the non-blocking `view.copy_(snap, non_blocking=True)` on the
+      restore side stream until the wait_event is inserted.
 """
 
 from typing import Callable, Dict, Iterable, Optional, Union
@@ -42,12 +48,13 @@ class _ULFMEngineMixin:
     Attributes set by the trainer before each train_batch_iter call:
       should_zero_loss_fn: If set and returns True, multiply loss by 0
           (rank should not contribute gradients for this microbatch).
-      pre_last_backward_fn: If set, called before the last microbatch's
-          backward to wait for async gradient restoration.
+      pre_first_backward_fn: If set, called once before the first microbatch's
+          backward. Used to wait on async gradient restoration so the main
+          stream is ordered after the side-stream copy_ into the grad buffer.
     """
 
     should_zero_loss_fn: Optional[Callable[[], bool]] = None
-    pre_last_backward_fn: Optional[Callable[[], None]] = None
+    pre_first_backward_fn: Optional[Callable[[], None]] = None
 
     def forward(
         self,
@@ -136,6 +143,10 @@ class ULFMOneForwardOneBackwardPipelineEngine(
         assert (
             self.nb_microbatches is not None
         ), "You must call `train_batch_iter` first and set `self.nb_microbatches`"
+        # Before micro 0's backward, cross-stream-sync any pending async grad
+        # restore so the main stream is ordered after the restore copy_.
+        if nb_backwards == 0 and self.pre_first_backward_fn is not None:
+            self.pre_first_backward_fn()
         is_ddp = isinstance(model, DistributedDataParallel)
         context_list = []
         if is_ddp:
@@ -144,9 +155,6 @@ class ULFMOneForwardOneBackwardPipelineEngine(
                 if grad_accumulator is not None:
                     context_list.append(grad_accumulator.no_sync())
             else:
-                # Last microbatch: wait for async restore, then enable DDP hooks
-                if self.pre_last_backward_fn is not None:
-                    self.pre_last_backward_fn()
                 context_list.append(ddp_trigger_sync_in_bwd(model_ddp=model))
         return ContextManagers(context_list)
 
@@ -165,6 +173,10 @@ class ULFMAllForwardAllBackwardPipelineEngine(
         assert (
             self.nb_microbatches is not None
         ), "You must call `train_batch_iter` first and set `self.nb_microbatches`"
+        # Before micro 0's backward, cross-stream-sync any pending async grad
+        # restore so the main stream is ordered after the restore copy_.
+        if nb_backwards == 0 and self.pre_first_backward_fn is not None:
+            self.pre_first_backward_fn()
         is_ddp = isinstance(model, DistributedDataParallel)
         context_list = []
         if is_ddp:
@@ -173,8 +185,5 @@ class ULFMAllForwardAllBackwardPipelineEngine(
                 if grad_accumulator is not None:
                     context_list.append(grad_accumulator.no_sync())
             else:
-                # Last microbatch: wait for async restore, then enable DDP hooks
-                if self.pre_last_backward_fn is not None:
-                    self.pre_last_backward_fn()
                 context_list.append(ddp_trigger_sync_in_bwd(model_ddp=model))
         return ContextManagers(context_list)

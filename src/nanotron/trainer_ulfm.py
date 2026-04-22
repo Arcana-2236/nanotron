@@ -233,14 +233,17 @@ class ULFMDistributedTrainer(DistributedTrainer):
                 work = self.parallel_context.world_pg.consensus(ulfm_opts)
                 work.wait()
 
-            # --- Wire pre_last_backward_fn (only for extended passes) ---
-            # Waits for async gradient restore before last microbatch backward.
+            # --- Wire pre_first_backward_fn (only for extended passes) ---
+            # Waits for async gradient restore before the first microbatch's
+            # backward — early micros' `_accumulate_grad` writes the fp32 buffer
+            # on the main stream, which races the non-blocking side-stream
+            # `view.copy_(snap)` until the wait_event is inserted.
             if self.ulfm_manager is not None and not is_first_pass:
-                self.pipeline_engine.pre_last_backward_fn = (
+                self.pipeline_engine.pre_first_backward_fn = (
                     lambda: self.ulfm_manager.wait_restore_before_backward()
                 )
             else:
-                self.pipeline_engine.pre_last_backward_fn = None
+                self.pipeline_engine.pre_first_backward_fn = None
 
             # --- Run pipeline: all microbatches fwd+bwd ---
             self.pipeline_engine.nb_microbatches = n_micro
