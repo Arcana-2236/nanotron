@@ -138,7 +138,9 @@ class NanotronULFMTrainingManager(ULFMTrainingManager):
         }
 
         hstate = HookState(pg=self.process_group, orchestrator=self.txn)
-        hook = create_ulfm_fp32_deferred_hook(accumulator, param_id_to_name)
+        hook = create_ulfm_fp32_deferred_hook(
+            accumulator, param_id_to_name, ulfm_opts=ulfm_opts
+        )
         self.ddp_model.register_comm_hook(state=hstate, hook=hook)
         # Prevent double-adding in accumulator._accumulate_grad()
         accumulator._is_accumulation_sync_step = True
