@@ -295,6 +295,12 @@ def get_args():
         default=None,
         help="Override pp (parallelism.pp)",
     )
+    parser.add_argument(
+        "--disable-ddp",
+        action="store_true",
+        default=None,
+        help="Override parallelism.disable_ddp: skip wrapping the model in DDP",
+    )
 
     # ULFM options
     parser.add_argument(

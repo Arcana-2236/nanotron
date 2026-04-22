@@ -38,6 +38,8 @@ class ParallelismArgs:
 
     expert_parallel_size: int = 1
 
+    disable_ddp: bool = False
+
     def __post_init__(self):
         # Conservative defaults
         if self.pp_engine is None:
