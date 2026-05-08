@@ -368,6 +368,7 @@ def init_optimizer_and_grad_accumulator(
                     split_groups.append({**base, "named_params": adamw_named, "use_muon": False})
             named_param_groups = split_groups
 
+            _tp_pg = parallel_context.tp_pg if parallel_context.tp_pg.size() > 1 else None
             def optimizer(param_groups):
                 return Muon(
                     param_groups,
@@ -379,6 +380,7 @@ def init_optimizer_and_grad_accumulator(
                     muon_mode=optimizer_args.optimizer_factory.muon_mode,
                     norm_mode=optimizer_args.optimizer_factory.norm_mode,
                     ns_steps=optimizer_args.optimizer_factory.ns_steps,
+                    tp_pg=_tp_pg,
                 )
 
         else:

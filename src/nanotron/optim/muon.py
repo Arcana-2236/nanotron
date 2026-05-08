@@ -33,6 +33,12 @@ _MUDAM_NS3_EARLY = [
     ( 3.9926,-10.0015,  9.4264),  # step 3
 ]
 
+_MUDAM_1B_NS3_EARLY = [
+    ( 4.3741, -7.7747,  3.4521),  # step 1
+    ( 3.2236, -4.7375,  1.9121),  # step 2
+    ( 3.2394, -4.7633,  2.4525),  # step 3
+]
+
 def _apply_ns3_abc(G, abc_list):
     """Apply a sequence of asymmetric NS steps with the given (a,b,c) per step."""
     assert len(G.shape) >= 2
@@ -59,6 +65,20 @@ def mudam_ns3_early(G, steps=3):
     `steps` is accepted for API compatibility but always runs exactly 3 steps.
     """
     return _apply_ns3_abc(G, _MUDAM_NS3_EARLY)
+
+
+def mudam_1b_ns3_early(G, steps=3):
+    """
+    3-step NS for MuDam with Remez-optimized coefficients for 1B model early training.
+
+    Derived from mement_logs_1b/ (_adam.pt, steps 50 and 100), 100 params per step,
+    2048x2048 matrices. The 1B model's NS input has a wider SV range than 60M:
+    sigma_hi ~0.91-0.95 vs ~0.87-0.88, which limits how tight the polynomial fit can be.
+
+    Interval: [0.023, 0.95]. max_err=0.113 vs 0.318 for standard NS5 — ~3x improvement.
+    `steps` is accepted for API compatibility but always runs exactly 3 steps.
+    """
+    return _apply_ns3_abc(G, _MUDAM_1B_NS3_EARLY)
 
 
 def jiacheng(G, steps):
@@ -231,6 +251,7 @@ class Muon(torch.optim.Optimizer):
         polar_args={},
         muon_mode="sgd",
         norm_mode="none",
+        tp_pg=None,
     ):
         """
         Accepts standard PyTorch param groups. Each group should have a "use_muon" bool
@@ -256,6 +277,8 @@ class Muon(torch.optim.Optimizer):
         )
 
         super().__init__(param_groups, defaults)
+        # Tensor Parallel process group (None means no TP or TP=1)
+        self.tp_pg = tp_pg
 
         # Instantiate the polar factorization method
         self.polar_factorizer = self._initialize_polar_factorizer(
@@ -274,6 +297,8 @@ class Muon(torch.optim.Optimizer):
             return partial(FastApplyPolarExpress, restart_interval=3, shift_eps=1e-3)
         elif polar_method == "mudam-ns3-early":
             return mudam_ns3_early
+        elif polar_method == "mudam-1b-ns3-early":
+            return mudam_1b_ns3_early
         elif polar_method == "svd-exact":
             return partial(
                 svd_exact_polar,
@@ -282,6 +307,40 @@ class Muon(torch.optim.Optimizer):
             )
         else:
             raise ValueError(f"Unknown polar method: {polar_method}")
+        
+    def _get_tp_sharding_info(self, param):
+        """Return (split_dim, tp_rank, tp_size, unsharded_shape) if param is TP-sharded, else None.
+
+        TP-sharded params are NanotronParameters whose global_ranks set includes all ranks
+        in self.tp_pg.  The split_dim is inferred from the non-trivial slice in global_slices.
+        """
+        if self.tp_pg is None or self.tp_pg.size() <= 1:
+            return None
+        try:
+            from nanotron.parallel.parameters import NanotronParameter
+            from nanotron.distributed import get_global_ranks
+        except ImportError:
+            return None
+        if not isinstance(param, NanotronParameter) or not param.is_sharded:
+            return None
+        sharded_info = param.get_sharded_info()
+        # Verify this is TP-sharded (not DP/ZeRO-sharded)
+        tp_global_ranks = set(get_global_ranks(self.tp_pg))
+        if not tp_global_ranks.issubset(set(sharded_info.global_ranks)):
+            return None
+        # Find sharded dimension: the one where global_slices[dim] != slice(None)
+        pair = sharded_info.local_global_slices_pairs[0]
+        split_dim = None
+        for dim, g_sl in enumerate(pair.global_slices):
+            if g_sl != slice(None):
+                split_dim = dim
+                break
+        if split_dim is None:
+            return None
+        import torch.distributed as tdist
+        tp_rank = tdist.get_rank(self.tp_pg)
+        tp_size = self.tp_pg.size()
+        return split_dim, tp_rank, tp_size, sharded_info.unsharded_shape
 
     def adjust_lr_for_muon(
         self,
@@ -350,7 +409,9 @@ class Muon(torch.optim.Optimizer):
                             state["moment2"] = torch.zeros_like(g)
                         state["moment1"].lerp_(g, 1 - beta1)
                         state["moment2"].lerp_(g.square(), 1 - beta2)
-                        g = state["moment1"] / (state["moment2"].sqrt() + eps)
+                        v_norm = state["moment2"].sqrt() + eps
+                        v_norm /= v_norm.min()
+                        g = state["moment1"] / v_norm
                     
                     elif muon_mode == "adafactor_preconditioned":
                         # Adafactor-preconditioned MuDam: replaces full O(m*n) second moment with
@@ -408,22 +469,62 @@ class Muon(torch.optim.Optimizer):
                         m_hat = state["moment1"] / (1 - beta1**t)
                         v_hat = state["moment2"] / (1 - beta2**t)
                         g = m_hat / (v_hat.sqrt() + eps)
+                    
+                    elif muon_mode == "normuon":
+                        # NorMuon: Muon with per-row RMS second-moment normalization post-orthogonalization
+                        if "momentum_buffer" not in state:
+                            state["momentum_buffer"] = torch.zeros_like(g)
+                            # per-row second moment buffer (shape: [..., 1]), float32 for stability
+                            state["second_momentum_buffer"] = torch.zeros_like(g[..., 0:1])
+                        buf = state["momentum_buffer"]
+                        buf.lerp_(g, 1 - momentum)
+                        g = g.lerp(buf, momentum) if group["nesterov"] else buf.clone()
 
                     else:
                         raise ValueError(f"Unknown muon_mode: {muon_mode}")
+                    
+                    _g_local = g  # keep local slice for lr computation (nuclear_scaling)
+                    _tp_info = self._get_tp_sharding_info(p)
+                    if _tp_info is not None:
+                        _tp_split_dim, _tp_rank, _tp_size, _tp_unsharded_shape = _tp_info
+                        import torch.distributed as _tdist
+                        _chunks = [torch.empty_like(g) for _ in range(_tp_size)]
+                        _tdist.all_gather(_chunks, g.contiguous(), group=self.tp_pg)
+                        g = torch.cat(_chunks, dim=_tp_split_dim)
 
                     u = self.polar_factorizer(g, group["ns_steps"])
+
+                    if _tp_info is not None:
+                        _chunk_size = u.shape[_tp_split_dim] // _tp_size
+                        u = u.narrow(_tp_split_dim, _tp_rank * _chunk_size, _chunk_size).contiguous()
+                        # Restore g to local shard so post-NS ops see the correct shape.
+                        g = _g_local
+
+                    if muon_mode == "normuon":
+                        beta2 = group["adamw_betas"][1]
+                        eps = group["adamw_eps"]
+                        sm_buf = state["second_momentum_buffer"]
+                        vnorm = u.norm(dim=(-2, -1), keepdim=True)
+                        v_mean = (u * u).mean(dim=-1, keepdim=True)
+                        sm_buf.lerp_(v_mean.to(sm_buf.dtype), 1 - beta2)
+                        step_size = 1.0 / sm_buf.to(u.dtype).sqrt().add_(eps)
+                        u = u * step_size
+                        vnorm_new = u.norm(dim=(-2, -1), keepdim=True)
+                        u = u * (vnorm / vnorm_new.add_(eps))
 
                     # Apply post-polar normalization if enabled
                     norm_mode = group.get("norm_mode", "none")
                     if norm_mode != "none":
                         u = apply_post_polar_norm(u, norm_mode=norm_mode)
 
+                    # For TP params use the unsharded shape so rms_scaling (sqrt(fan_out/fan_in))
+                    # reflects the full weight dimensions, not the local shard.
+                    _param_shape = _tp_unsharded_shape if _tp_info is not None else p.shape
                     adjusted_lr = self.adjust_lr_for_muon(
                         lr,
                         group["rms_scaling"],
                         group["nuclear_scaling"],
-                        p.shape,
+                        _param_shape,
                         g.bfloat16(),
                         u,
                     )

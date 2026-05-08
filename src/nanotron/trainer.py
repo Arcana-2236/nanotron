@@ -228,7 +228,7 @@ class DistributedTrainer:
             self.metadata: TrainingMetadata = checkpoint_metadata.metas
             # NOTE: we should not change data stages
             assert (
-                self.config.tokens.train_steps > self.metadata.last_train_step
+                self.config.tokens.train_steps >= self.metadata.last_train_step
             ), f"Loaded checkpoint has already trained {self.metadata.last_train_step} batches, you need to specify a higher `config.tokens.train_steps`"
         else:
             data_stages = [
@@ -651,6 +651,16 @@ class DistributedTrainer:
 
         if self.config.checkpoints.save_final_state:
             self.save_checkpoint()
+
+        # Run final validation at end of training if val dataloader is available
+        if self._val_dataloader_factory is not None:
+            log_rank(
+                "[Validation] Running final validation at end of training",
+                logger=logger,
+                level=logging.INFO,
+                rank=0,
+            )
+            self.run_validation()
 
         self.post_training()
 

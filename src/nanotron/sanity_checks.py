@@ -266,7 +266,10 @@ def after_optim_step_sanity_checks(
 def check_optim_state_in_sync(optim_state_dict: dict, pg: dist.ProcessGroup):
     for _, optim_state in sorted(optim_state_dict["state"].items(), key=lambda x: x[0]):
         for name, tensor in optim_state.items():
-            if name == "step":
+            # Skip non-tensor states (e.g. Python-int step counters like Adam's "step"
+            # or Muon's "muon_step").  These cannot be broadcast and are always in sync
+            # because every rank increments them identically.
+            if not isinstance(tensor, torch.Tensor):
                 continue
             assert_tensor_synced_across_pg(
                 tensor=tensor, pg=pg, msg=lambda err: f"{name} are not synced across DP {err}"
