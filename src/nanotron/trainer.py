@@ -1111,18 +1111,66 @@ class DistributedTrainer:
         self._mark_tied_parameters(model=model, parallel_context=parallel_context, parallel_config=parallel_config)
 
         # count number of parameters
+        # Expert params are unique across (TP, EP); non-expert params are unique across TP only
+        # and replicated across EP. They must be reduced over different groups.
         num_params = sum(p.numel() for p in model.parameters())
         size_params = sum(p.numel() * p.element_size() for p in model.parameters())
-        total_params = torch.tensor(num_params, device="cuda")
-        total_size = torch.tensor(size_params, device="cuda")
-        dist.all_reduce(total_params, group=parallel_context.tp_pg, async_op=False, op=dist.ReduceOp.SUM)  # TP
-        dist.all_reduce(total_params, group=parallel_context.pp_pg, async_op=False, op=dist.ReduceOp.SUM)  # PP
-        dist.all_reduce(total_size, group=parallel_context.tp_pg, async_op=False, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_size, group=parallel_context.pp_pg, async_op=False, op=dist.ReduceOp.SUM)
+
+        local_expert_num = 0
+        local_other_num = 0
+        local_expert_sz = 0
+        local_other_sz = 0
+        for name, p in model.named_parameters():
+            is_expert = False
+            if isinstance(p, NanotronParameter) and p.is_sharded:
+                if p.get_sharded_info().is_expert_sharded(parallel_context):
+                    is_expert = True
+            # Fallback for the experts_per_rank==1 path where the expert is wrapped in
+            # TensorParallelColumnLinear/RowLinear and only marked TP-sharded.
+            if not is_expert and ".block_sparse_moe.experts." in name:
+                is_expert = True
+            if is_expert:
+                local_expert_num += p.numel()
+                local_expert_sz += p.numel() * p.element_size()
+            else:
+                local_other_num += p.numel()
+                local_other_sz += p.numel() * p.element_size()
+
+        def _reduce(val: int, groups) -> int:
+            t = torch.tensor(val, device="cuda")
+            for g in groups:
+                dist.all_reduce(t, group=g, async_op=False, op=dist.ReduceOp.SUM)
+            return t.item()
+
+        other_num = _reduce(local_other_num, [parallel_context.tp_pg, parallel_context.pp_pg])
+        other_sz = _reduce(local_other_sz, [parallel_context.tp_pg, parallel_context.pp_pg])
+        expert_num = _reduce(
+            local_expert_num,
+            [parallel_context.tp_pg, parallel_context.expert_pg, parallel_context.pp_pg],
+        )
+        expert_sz = _reduce(
+            local_expert_sz,
+            [parallel_context.tp_pg, parallel_context.expert_pg, parallel_context.pp_pg],
+        )
+        total_num = other_num + expert_num
+        total_sz = other_sz + expert_sz
 
         # TODO @nouamanetazi: better memory logs
+        if expert_num > 0:
+            top_k = getattr(config.model.model_config, "num_experts_per_tok", None)
+            num_experts = getattr(config.model.model_config, "moe_num_experts", None)
+            if top_k and num_experts:
+                active_num = other_num + expert_num * top_k // num_experts
+                moe_breakdown = (
+                    f" (non-expert: {human_format(other_num)}, expert: {human_format(expert_num)}, "
+                    f"active/token: {human_format(active_num)} = {top_k}/{num_experts} experts)"
+                )
+            else:
+                moe_breakdown = f" (non-expert: {human_format(other_num)}, expert: {human_format(expert_num)})"
+        else:
+            moe_breakdown = ""
         log_rank(
-            f"Total number of parameters: {human_format(total_params.item())} ({total_size.item() / 1024**2:.2f}MiB)",
+            f"Total number of parameters: {human_format(total_num)}{moe_breakdown} ({total_sz / 1024**2:.2f}MiB)",
             logger=logger,
             level=logging.INFO,
             group=parallel_context.world_pg,
