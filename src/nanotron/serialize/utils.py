@@ -18,12 +18,15 @@ class ObjectType(Enum):
 
 def get_exp_tp_pp_rank_and_size_from(
     world_rank: int, parallel_context: ParallelContext
-) -> Tuple[Tuple[int, int], Tuple[int, int]]:
-    result = parallel_context.get_local_ranks(world_rank=world_rank)
+) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
+    # New 3-D layout: get_local_ranks returns (pp_rank, dp_rank, tp_rank).
+    pp_rank, dp_rank, tp_rank = parallel_context.get_local_ranks(world_rank=world_rank)
+    ep = parallel_context.expert_parallel_size
+    exp_rank = dp_rank % ep  # EP coordinate derived from the (now-merged) DP axis.
     return (
-        (result[0], parallel_context.expert_pg.size()),
-        (result[3], parallel_context.tp_pg.size()),
-        (result[1], parallel_context.pp_pg.size()),
+        (exp_rank, parallel_context.expert_pg.size()),
+        (tp_rank, parallel_context.tp_pg.size()),
+        (pp_rank, parallel_context.pp_pg.size()),
     )
 
 

@@ -26,14 +26,14 @@ from nanotron.serialize.utils import ObjectType, merge_and_shard_tp_tensors
 # TODO(xrsrke): take rank instead of parallel_context
 def optimizer_filename(parallel_context: ParallelContext, is_zero: bool):
     if is_zero is True:
-        return f"{ObjectType.OPTIMIZER.value}_pp-{dist.get_rank(parallel_context.pp_pg)}-of-{parallel_context.pp_pg.size()}_dp-{dist.get_rank(parallel_context.dp_pg)}-of-{parallel_context.dp_pg.size()}_tp-{dist.get_rank(parallel_context.tp_pg)}-of-{parallel_context.tp_pg.size()}_exp-{dist.get_rank(parallel_context.expert_pg)}-of-{parallel_context.expert_parallel_size}.pt"
+        return f"{ObjectType.OPTIMIZER.value}_pp-{dist.get_rank(parallel_context.pp_pg)}-of-{parallel_context.pp_pg.size()}_dp-{dist.get_rank(parallel_context.expert_dp_pg)}-of-{parallel_context.expert_dp_pg.size()}_tp-{dist.get_rank(parallel_context.tp_pg)}-of-{parallel_context.tp_pg.size()}_exp-{dist.get_rank(parallel_context.expert_pg)}-of-{parallel_context.expert_parallel_size}.pt"
     else:
         return f"{ObjectType.OPTIMIZER.value}_pp-{dist.get_rank(parallel_context.pp_pg)}-of-{parallel_context.pp_pg.size()}_tp-{dist.get_rank(parallel_context.tp_pg)}-of-{parallel_context.tp_pg.size()}_exp-{dist.get_rank(parallel_context.expert_pg)}-of-{parallel_context.expert_parallel_size}.pt"
 
 
 def lr_scheduler_filename(parallel_context: ParallelContext, is_zero: bool):
     if is_zero is True:
-        return f"{ObjectType.LR_SCHEDULER.value}_pp-{dist.get_rank(parallel_context.pp_pg)}-of-{parallel_context.pp_pg.size()}_dp-{dist.get_rank(parallel_context.dp_pg)}-of-{parallel_context.dp_pg.size()}_tp-{dist.get_rank(parallel_context.tp_pg)}-of-{parallel_context.tp_pg.size()}_exp-{dist.get_rank(parallel_context.expert_pg)}-of-{parallel_context.expert_parallel_size}.pt"
+        return f"{ObjectType.LR_SCHEDULER.value}_pp-{dist.get_rank(parallel_context.pp_pg)}-of-{parallel_context.pp_pg.size()}_dp-{dist.get_rank(parallel_context.expert_dp_pg)}-of-{parallel_context.expert_dp_pg.size()}_tp-{dist.get_rank(parallel_context.tp_pg)}-of-{parallel_context.tp_pg.size()}_exp-{dist.get_rank(parallel_context.expert_pg)}-of-{parallel_context.expert_parallel_size}.pt"
     else:
         return f"{ObjectType.LR_SCHEDULER.value}_pp-{dist.get_rank(parallel_context.pp_pg)}-of-{parallel_context.pp_pg.size()}_tp-{dist.get_rank(parallel_context.tp_pg)}-of-{parallel_context.tp_pg.size()}_exp-{dist.get_rank(parallel_context.expert_pg)}-of-{parallel_context.expert_parallel_size}.pt"
 
@@ -47,8 +47,12 @@ def save_optimizer(
     - If Zero-0 is used, optimizer states are replicated across all DPs. Only DP-0 saves the states
     - If Zero-1 is used, optimizer states are sharded across all DPs. Each DP saves its own states
     """
-    if (not optimizer.inherit_from(optim.ZeroDistributedOptimizer)) and dist.get_rank(parallel_context.dp_pg) > 0:
-        # this is Zero-0, so only DP-0 saves the optimizer states
+    if (not optimizer.inherit_from(optim.ZeroDistributedOptimizer)) and dist.get_rank(parallel_context.expert_dp_pg) > 0:
+        # Zero-0: optimizer states are replicated across expert_dp_pg (the orthogonal
+        # complement of EP inside DP). Only expert_dp_pg-rank-0 writes; the resulting
+        # filename embeds the expert_dp coordinate (via optimizer_filename) so each
+        # writer produces a unique path. Under the old orthogonal-EP layout this
+        # reduced to `dp_pg-rank-0` because expert_dp_pg == dp_pg.
         return
 
     # TODO: Figure out if I need to save param groups. Right now I'm assuming no as we only store what's trainable
@@ -113,8 +117,9 @@ def save_lr_scheduler(
     root_folder: Path,
 ):
     """Saves lr scheduler states"""
-    if not is_zero and dist.get_rank(parallel_context.dp_pg) > 0:
-        # this is Zero-0, so only DP-0 saves the optimizer states
+    if not is_zero and dist.get_rank(parallel_context.expert_dp_pg) > 0:
+        # Same Zero-0 reasoning as `save_optimizer`: write only on expert_dp_pg-rank-0
+        # under the new EP-as-subset-of-DP layout.
         return
 
     root_folder = root_folder / "lr_scheduler"

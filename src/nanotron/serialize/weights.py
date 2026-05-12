@@ -30,10 +30,11 @@ logger = logging.get_logger(__name__)
 def save_weights(model: nn.Module, parallel_context: ParallelContext, root_folder: Path):
     root_folder = root_folder / "model"
 
-    # We save only `dist.get_rank(parallel_context.dp_pg) == 0`
-    # TODO @thomasw21: Figure how this works with Zero-3
-    if dist.get_rank(parallel_context.dp_pg) != 0:
-        return
+    # Under EP-as-subset-of-DP, the old "skip everything unless dp_rank == 0" early
+    # return would silently drop expert shards on dp_rank > 0. We instead apply a
+    # per-param filter below.
+    expert_dp_rank = dist.get_rank(parallel_context.expert_dp_pg)
+    dp_rank = dist.get_rank(parallel_context.dp_pg)
 
     module_id_to_prefix = {id(module): f"{module_name}." for module_name, module in model.named_modules()}
     # Fix the root_model
@@ -42,9 +43,16 @@ def save_weights(model: nn.Module, parallel_context: ParallelContext, root_folde
     # We chunk everything by `tp_world_size` in order to make sure that we gather all the weights into a single device before saving it
     for name, param_or_buffer in tqdm(model.state_dict().items(), desc="Saving weights"):
 
-        # exp_rank=0 saves all weights whereas exp_rank>0 save only MLP weights
-        if dist.get_rank(parallel_context.expert_pg) != 0:
-            if "experts" not in name:
+        is_expert_param = ".block_sparse_moe.experts." in name
+        if is_expert_param:
+            # Expert params live uniquely per dp_rank within an EP group. Only one
+            # writer per ep_pg group (expert_dp_rank == 0) writes; the others are
+            # bit-identical replicas across expert_dp_pg.
+            if expert_dp_rank != 0:
+                continue
+        else:
+            # Non-expert params are replicated across the full DP world. Only one writer.
+            if dp_rank != 0:
                 continue
 
         # `state_dict` doesn't return a Param or a buffer, just a tensors which loses some metadata
