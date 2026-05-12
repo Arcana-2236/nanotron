@@ -30,6 +30,30 @@ trainer = DistributedTrainer(config_file, model_class=LlaMoEForTraining, model_c
 - Run training as usual
 
 
+## Parallelism semantics (post 2026-05-11 refactor)
+
+`expert_parallel_size` now subdivides DP rather than adding a separate axis. The world size
+formula is `tp × pp × dp` (NOT `× expert_parallel_size`). With `dp=4, expert_parallel_size=4`,
+training uses 4 GPUs — each rank holds a unique data shard *and* one (or more, if
+`moe_num_experts > expert_parallel_size`) expert(s). All-to-all token routing happens inside
+the EP sub-group of `dp_pg`.
+
+Constraints:
+- `dp % expert_parallel_size == 0`.
+- `moe_num_experts % expert_parallel_size == 0` (pre-existing megablocks constraint).
+
+Old checkpoints from before this refactor need conversion:
+
+```
+python tools/convert_checkpoint_ep_subset.py \
+    --src OLD_CHECKPOINT_DIR --dst NEW_CHECKPOINT_DIR \
+    --dp_old <old DP> --ep <expert_parallel_size>
+```
+
+Per-device FLOPs/s reported by `get_flops_per_sec` will increase compared to the old layout:
+the same model FLOPs are now amortized over fewer devices, which is the expected (correct)
+behavior.
+
 ## Credits
 Credits to the following repositories from which the code was adapted:
 - https://github.com/huggingface/transformers/blob/main/src/transformers/models/mixtral/modeling_mixtral.py
