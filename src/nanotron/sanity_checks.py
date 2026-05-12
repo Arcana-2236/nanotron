@@ -298,32 +298,46 @@ def check_optim_state_in_sync(
 ):
     """Per-param sync check: non-expert state is compared across dp_pg, expert state
     across expert_dp_pg. Under DP=EP the expert group is size 1 and the check is a no-op
-    for expert state."""
-    # Build state-index → Parameter map by walking the param groups in the SAME order
-    # as the state_dict (state_dict numbers params sequentially through param_groups).
+    for expert state.
+
+    Identifying expert state by Parameter identity is unreliable when the optimizer
+    wraps the model in OptimizerFromGradientAccumulator: it builds fresh FP32 buffer
+    parameters and the model's `_is_expert` marker is not propagated to them. Identify
+    by the NamedOptimizer "names" map (canonical) and fall back to is_expert_param.
+    """
     state_dict = optimizer.state_dict()
+    idx_to_name = state_dict.get("names", {})
+
+    # For the param-identity fallback (when no NamedOptimizer wrapper is present),
+    # build a state-index → Parameter map matching torch's flat enumeration through
+    # param_groups (id(p) → packed index, sequential).
     index_to_param = {}
-    state_index = 0
-    for real_group in optimizer.param_groups:
-        for param in real_group["params"]:
-            index_to_param[state_index] = param
-            state_index += 1
+    if not idx_to_name:
+        state_index = 0
+        for real_group in optimizer.param_groups:
+            for param in real_group["params"]:
+                index_to_param[state_index] = param
+                state_index += 1
 
     for idx, optim_state in sorted(state_dict["state"].items(), key=lambda x: x[0]):
-        param = index_to_param.get(idx)
-        pg = (
-            parallel_context.expert_dp_pg
-            if isinstance(param, torch.nn.Parameter) and is_expert_param(param)
-            else parallel_context.dp_pg
-        )
+        param_name = idx_to_name.get(idx)
+        if param_name is not None:
+            is_expert = ".block_sparse_moe.experts." in param_name
+        else:
+            p = index_to_param.get(idx)
+            is_expert = isinstance(p, torch.nn.Parameter) and is_expert_param(p)
+        pg = parallel_context.expert_dp_pg if is_expert else parallel_context.dp_pg
         if pg.size() == 1:
             continue
-        for name, tensor in optim_state.items():
+        label = param_name or f"state[{idx}]"
+        for state_name, tensor in optim_state.items():
             # Skip non-tensor states (e.g. Python-int step counters like Adam's "step"
             # or Muon's "muon_step").  These cannot be broadcast and are always in sync
             # because every rank increments them identically.
             if not isinstance(tensor, torch.Tensor):
                 continue
             assert_tensor_synced_across_pg(
-                tensor=tensor, pg=pg, msg=lambda err: f"{name} are not synced across DP {err}"
+                tensor=tensor,
+                pg=pg,
+                msg=lambda err: f"{state_name} for {label} are not synced across DP {err}",
             )
