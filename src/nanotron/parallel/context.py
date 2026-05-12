@@ -111,22 +111,20 @@ class ParallelContext:
             [ranks[:, dp_rank, :].reshape(-1) for dp_rank in range(self.data_parallel_size)]
         )
 
-        # expert MP (expert clip-grad): TP x PP x EP for a given expert_dp coordinate.
+        # expert MP (expert clip-grad): TP × PP × EP for a given expert_dp coordinate.
+        # One group per expert_dp coordinate; membership does not depend on intra-EP rank.
         expert_mp_groups = []
-        for intra in range(ep):
-            for edp in range(num_ep_groups_per_slot):
-                expert_mp_groups.append(
-                    np.array(
-                        [
-                            ranks[pp_rank, edp * ep + ep_inner, tp_rank]
-                            for pp_rank in range(self.pipeline_parallel_size)
-                            for tp_rank in range(self.tensor_parallel_size)
-                            for ep_inner in range(ep)
-                        ]
-                    )
+        for edp in range(num_ep_groups_per_slot):
+            expert_mp_groups.append(
+                np.array(
+                    [
+                        ranks[pp_rank, edp * ep + ep_inner, tp_rank]
+                        for pp_rank in range(self.pipeline_parallel_size)
+                        for tp_rank in range(self.tensor_parallel_size)
+                        for ep_inner in range(ep)
+                    ]
                 )
-                break  # all `intra` produce the same expert-MP membership; one is enough
-        # Deduplicate by sorted tuple (create_new_group already does this, but be explicit).
+            )
         self.expert_mp_pg = self.create_new_group(np.array(expert_mp_groups))
 
         # tp_and_expert_pg: TP x EP for a given (pp, expert_dp) -- used by SparseMLP marker.
@@ -176,6 +174,14 @@ class ParallelContext:
 
     def get_local_ranks(self, world_rank: int) -> Tuple[int, int, int]:
         return tuple(i.item() for i in np.where(self.world_rank_matrix == world_rank))
+
+    def ep_rank_of(self, dp_rank: int) -> int:
+        """EP coordinate of a given DP rank under the EP-as-subset-of-DP layout."""
+        return dp_rank % self.expert_parallel_size
+
+    def expert_dp_rank_of(self, dp_rank: int) -> int:
+        """expert-DP coordinate (cross-EP-group) of a given DP rank."""
+        return dp_rank // self.expert_parallel_size
 
     def destroy(self):
         if not dist.is_initialized():
