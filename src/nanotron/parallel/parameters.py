@@ -86,6 +86,12 @@ class ShardedInfo:
         return set(dist.get_global_ranks(parallel_context.tp_pg)).issubset(set(self.global_ranks))
 
     def is_expert_sharded(self, parallel_context) -> bool:
+        # Under EP=1 the expert_pg is a singleton per rank, so the subset test would
+        # trivially pass for every TP-sharded non-expert param (since my_rank is in
+        # the param's TP-group). Guard on expert_parallel_size > 1 to avoid
+        # mismarking non-expert params and excluding them from DDP.
+        if parallel_context.expert_parallel_size <= 1:
+            return False
         return set(dist.get_global_ranks(parallel_context.expert_pg)).issubset(set(self.global_ranks))
 
     def is_dp_sharded(self, parallel_context):
