@@ -98,3 +98,16 @@ def _check_rank_helpers(parallel_context):
 @rerun_if_address_is_in_use()
 def test_rank_helpers_dp4_ep2():
     init_distributed(tp=1, dp=4, pp=1, ep=2)(_check_rank_helpers)()
+
+
+from nanotron.config.parallelism_config import ParallelismArgs
+
+
+def test_parallelism_args_rejects_indivisible_ep():
+    with pytest.raises(AssertionError, match="must be divisible by expert_parallel_size"):
+        ParallelismArgs(dp=3, pp=1, tp=1, expert_parallel_size=2)
+
+
+def test_parallelism_args_accepts_divisible_ep():
+    args = ParallelismArgs(dp=4, pp=1, tp=1, expert_parallel_size=2)
+    assert args.expert_parallel_size == 2

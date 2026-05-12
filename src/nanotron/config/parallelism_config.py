@@ -36,6 +36,8 @@ class ParallelismArgs:
 
     tp_recompute_allgather: bool = True
 
+    # expert_parallel_size: subdivides DP (does NOT multiply world size).
+    # World size = tp * pp * dp. dp must be divisible by expert_parallel_size.
     expert_parallel_size: int = 1
 
     def __post_init__(self):
@@ -51,3 +53,11 @@ class ParallelismArgs:
             self.pp_engine = cast_str_to_pipeline_engine(self.pp_engine)
         if isinstance(self.tp_mode, str):
             self.tp_mode = TensorParallelLinearMode[self.tp_mode.upper()]
+
+        if self.expert_parallel_size > 1:
+            assert (
+                self.dp % self.expert_parallel_size == 0
+            ), (
+                f"dp ({self.dp}) must be divisible by expert_parallel_size "
+                f"({self.expert_parallel_size}). expert_parallel_size now subdivides DP."
+            )
