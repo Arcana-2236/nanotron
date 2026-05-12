@@ -63,7 +63,7 @@ from nanotron.models.llama import LlamaForTraining, RotaryEmbedding
 from nanotron.models.starcoder2 import Starcoder2ForTraining
 from nanotron.optim.clip_grads import clip_grad_norm
 from nanotron.parallel import ParallelContext
-from nanotron.parallel.data_parallel.utils import sync_expert_gradients, sync_gradients_across_dp
+from nanotron.parallel.data_parallel.utils import mark_expert, sync_expert_gradients, sync_gradients_across_dp
 from nanotron.parallel.parameters import NanotronParameter, sanity_check
 from nanotron.parallel.pipeline_parallel.engine import (
     PipelineEngine,
@@ -1213,7 +1213,7 @@ class DistributedTrainer:
                     is_expert = True
             if not is_expert and ".block_sparse_moe.experts." in name:
                 is_expert = True
-            param._is_expert = is_expert
+            mark_expert(param, is_expert)
             if is_expert:
                 expert_param_names.append(name)
 
@@ -1223,6 +1223,10 @@ class DistributedTrainer:
             check_model_has_grad(model=model, parallel_context=parallel_context)
             # TODO @thomasw21: DDP doesn't support broadcasting complex buffers (and we don't really need that broadcasting anyway)
             if expert_param_names:
+                # NOTE: private torch DDP API; required to keep expert params out of the
+                # dp_pg reducer (they are reduced on expert_dp_pg by sync_expert_gradients).
+                # Tested against torch 2.x; if a future torch removes this, fall back to
+                # registering experts in a separate module not wrapped by DDP.
                 DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(
                     model, expert_param_names
                 )

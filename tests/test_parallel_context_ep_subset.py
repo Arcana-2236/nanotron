@@ -107,10 +107,13 @@ def _check_expert_grad_reduced_on_expert_dp_pg(parallel_context):
     if parallel_context.expert_dp_pg.size() == 1:
         return  # nothing to test in this layout
     # Build a fake expert-marked parameter and verify averaging.
+    from nanotron.parallel.data_parallel.utils import mark_expert, sync_expert_gradients
+
     p = torch.nn.Parameter(torch.zeros(2, device="cuda"))
-    p._is_expert = True
+    mark_expert(p)
+    # Seed each rank's gradient with its own world rank so the post-reduce
+    # value equals the mean of world ranks within this expert_dp_pg group.
     p.grad = torch.full_like(p.data, float(dist.get_rank(parallel_context.world_pg)))
-    from nanotron.parallel.data_parallel.utils import sync_expert_gradients
 
     class Holder(torch.nn.Module):
         def __init__(self, p):

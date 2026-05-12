@@ -6,6 +6,22 @@ from nanotron import distributed as dist
 from nanotron.optim.gradient_accumulator import GradientAccumulator
 from torch import nn
 
+# Single source of truth for the expert-parameter marker. Use mark_expert /
+# is_expert_param accessors rather than touching the attribute directly so a
+# typo can't silently degrade an expert param into a non-expert one (which
+# would skip the expert_dp_pg all-reduce without raising).
+EXPERT_PARAM_ATTR = "_is_expert"
+
+
+def mark_expert(param: torch.nn.Parameter, value: bool = True) -> None:
+    """Tag a parameter as expert (or non-expert) for downstream grad/clip routing."""
+    setattr(param, EXPERT_PARAM_ATTR, value)
+
+
+def is_expert_param(param: torch.nn.Parameter) -> bool:
+    """Return True iff `param` was tagged via mark_expert."""
+    return getattr(param, EXPERT_PARAM_ATTR, False)
+
 
 @contextmanager
 def ddp_trigger_sync_in_bwd(model_ddp):
@@ -67,7 +83,7 @@ def sync_expert_gradients(
         return
 
     for name, param in module.named_parameters():
-        if not getattr(param, "_is_expert", False):
+        if not is_expert_param(param):
             continue
         if grad_accumulator is not None:
             grad = grad_accumulator.get_grad_buffer(name=name)
