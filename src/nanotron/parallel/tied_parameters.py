@@ -47,10 +47,11 @@ def tie_parameters(
         raise ValueError("Can't tie nothing")
 
     # TODO @thomasw21: When we support Zero3 this isn't true anymore
+    # world_rank_matrix is 3-D [pp, dp, tp] (Task 1 refactor), so index [1] is dp_rank.
     dp_ranks = tuple(
         sorted(
             {
-                parallel_context.get_local_ranks(world_rank=global_rank)[2]
+                parallel_context.get_local_ranks(world_rank=global_rank)[1]
                 for _, global_ranks in ties
                 for global_rank in global_ranks
             }
