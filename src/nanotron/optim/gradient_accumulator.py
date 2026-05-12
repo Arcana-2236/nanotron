@@ -237,10 +237,19 @@ class FP32GradientAccumulator(GradientAccumulator):
         assert half_param.grad is not None, f"Expected param {name} to have gradient."
         fp32_grad = self.get_grad_buffer(name=name)
 
-        if self._is_accumulation_sync_step is False:
+        # On the sync micro-batch (`_is_accumulation_sync_step=True`), DDP's
+        # `fp32_accum_hook` performs the bf16→fp32 accumulation for params in DDP's
+        # buckets. Under EP-as-subset-of-DP, expert params are excluded from DDP via
+        # `_set_params_and_buffers_to_ignore_for_model`, so the hook NEVER fires for
+        # them. If we skip them here too, the last micro-batch's expert grad is
+        # silently dropped (1/N of expert training signal lost). Accumulate them
+        # manually instead. The downstream all-reduce on expert_dp_pg is handled
+        # separately by `sync_expert_gradients`.
+        from nanotron.parallel.data_parallel.utils import is_expert_param
+
+        if self._is_accumulation_sync_step is False or is_expert_param(half_param):
             # WARNING: We assume fp32_grad_bucket is already zeroed
             fp32_grad.add_(half_param.grad)
-            # In case _is_accumulation_sync_step = True: no need to add half gradients, because it's done in the allreduce hook
 
         # TODO @thomasw21: Is it better to set to zero instead?
         half_param.grad = None
