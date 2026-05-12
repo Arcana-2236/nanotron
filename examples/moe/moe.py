@@ -375,40 +375,6 @@ class ParallelDroplessMLP(torch.nn.Module):
         )
 
 
-class ScaleGradient(torch.autograd.Function):
-    @staticmethod
-    @torch.cuda.amp.custom_fwd
-    def forward(ctx, x, scale):
-        ctx.scale = scale
-        return x
-
-    @staticmethod
-    @torch.cuda.amp.custom_bwd
-    def backward(ctx, grad):
-        return grad * ctx.scale, None
-
-
-scale_gradient = ScaleGradient.apply
-
-
-class ExpertParallel(nn.Module):
-    """
-    ExpertParallel serves to scale the gradients of the expert weights because unlike DP the gradients are not averaged across the expert parallel group.
-    """
-
-    def __init__(self, module, expert_parallel_size: int):
-        super().__init__()
-        self.module = module
-        self.expert_parallel_size = expert_parallel_size
-
-    def forward(self, *args, **kwargs):
-        self.scale_gradients()
-        return self.module(*args, **kwargs)
-
-    def scale_gradients(self):
-        scale_gradient(self.module, 1 / self.expert_parallel_size)
-
-
 class SparseMLP(nn.Module):
     def __init__(
         self,
@@ -422,17 +388,15 @@ class SparseMLP(nn.Module):
         self.experts_per_rank = config.moe_num_experts // min(self.expert_pg_size, config.moe_num_experts)
         self.tp_pg = parallel_context.tp_pg
 
-        self.w1 = ExpertParallel(
-            nn.Linear(
-                config.hidden_size, config.intermediate_size * self.experts_per_rank // self.tp_pg.size(), bias=False
-            ),
-            expert_parallel_size=self.expert_pg_size,
+        self.w1 = nn.Linear(
+            config.hidden_size,
+            config.intermediate_size * self.experts_per_rank // self.tp_pg.size(),
+            bias=False,
         )
-        self.w2 = ExpertParallel(
-            nn.Linear(
-                config.hidden_size, config.intermediate_size * self.experts_per_rank // self.tp_pg.size(), bias=False
-            ),
-            expert_parallel_size=self.expert_pg_size,
+        self.w2 = nn.Linear(
+            config.hidden_size,
+            config.intermediate_size * self.experts_per_rank // self.tp_pg.size(),
+            bias=False,
         )
 
         mark_all_parameters_in_module_as_sharded(
@@ -442,7 +406,7 @@ class SparseMLP(nn.Module):
         )
 
         if self.tp_pg.size() == 1:
-            self.w1.module.weight.data = self.w1.module.weight.data.T.contiguous()
+            self.w1.weight.data = self.w1.weight.data.T.contiguous()
 
         # TODO @nouamane: jit
         self.act = partial(F.gelu, approximate="tanh")
@@ -450,10 +414,9 @@ class SparseMLP(nn.Module):
         self.dsd = partial(wp.dsd_nn, group=self.tp_pg) if self.tp_pg.size() > 1 else stk.ops.dsd
 
     def forward(self, x, topo):
-        self.w1.scale_gradients(), self.w2.scale_gradients()
-        x = self.sdd(x.contiguous(), self.w1.module.weight, topo)
+        x = self.sdd(x.contiguous(), self.w1.weight, topo)
         activation_fn_out = act_fn(x, self.act)
-        return self.dsd(activation_fn_out, self.w2.module.weight)
+        return self.dsd(activation_fn_out, self.w2.weight)
 
 
 class MLP(nn.Module):
@@ -475,29 +438,23 @@ class MLP(nn.Module):
 
         assert self.experts_per_rank == 1, "moe.MLP only supports 1 expert per rank, otherwise use moe.SparseMLP"
 
-        self.w1 = ExpertParallel(
-            TensorParallelColumnLinear(
-                config.hidden_size,
-                config.intermediate_size * self.experts_per_rank,
-                pg=tp_pg,
-                mode=tp_mode,
-                bias=False,
-                async_communication=tp_linear_async_communication,
-            ),
-            expert_parallel_size=self.expert_pg_size,
+        self.w1 = TensorParallelColumnLinear(
+            config.hidden_size,
+            config.intermediate_size * self.experts_per_rank,
+            pg=tp_pg,
+            mode=tp_mode,
+            bias=False,
+            async_communication=tp_linear_async_communication,
         )
 
-        self.w2 = ExpertParallel(
-            TensorParallelRowLinear(
-                config.intermediate_size * self.experts_per_rank,
-                config.hidden_size,
-                pg=tp_pg,
-                mode=tp_mode,
-                bias=False,
-                async_communication=tp_linear_async_communication
-                and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
-            ),
-            expert_parallel_size=self.expert_pg_size,
+        self.w2 = TensorParallelRowLinear(
+            config.intermediate_size * self.experts_per_rank,
+            config.hidden_size,
+            pg=tp_pg,
+            mode=tp_mode,
+            bias=False,
+            async_communication=tp_linear_async_communication
+            and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
         )
         # TODO @nouamane: jit
         self.act = partial(F.gelu, approximate="tanh")
