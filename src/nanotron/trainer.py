@@ -1383,10 +1383,13 @@ def mark_tied_parameters(
     # Tie custom params
     model.tie_custom_params()
 
-    # Sync all parameters that have the same name and that are not sharded across TP and EXP
+    # Sync all parameters that have the same name and that are not sharded across TP.
+    # Under EP-as-subset-of-DP, ep_pg members hold different data shards, so a tie across
+    # the EP group identifies non-replicas — DDP on dp_pg already keeps non-expert params
+    # in sync, no explicit tie needed. (`mark_unsharded_params_as_tied_across_expert` is
+    # retained below as dead code; consider removing in a follow-up.)
     assert not isinstance(model, DistributedDataParallel), "model shouldn't be DDP at this point"
     mark_unsharded_params_as_tied_across_tp(model, parallel_context, parallel_config)
-    mark_unsharded_params_as_tied_across_expert(model, parallel_context, parallel_config)
 
     create_pg_for_tied_weights(root_module=model, parallel_context=parallel_context)
 

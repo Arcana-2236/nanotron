@@ -110,7 +110,10 @@ optimizer = OptimizerArgs(
 )
 
 parallelism = ParallelismArgs(
-    dp=1,
+    # Under EP-as-subset-of-DP, world_size = tp * pp * dp and dp % expert_parallel_size == 0.
+    # This default targets 4 GPUs: 2 DP ranks per (pp, tp), with EP=2 carving each pair into a
+    # 2-expert group. Override via YAML for your real run.
+    dp=2,
     pp=1,
     tp=2,
     expert_parallel_size=2,
