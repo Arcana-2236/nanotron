@@ -1,6 +1,7 @@
 import pytest
 from helpers.utils import available_gpus, init_distributed, rerun_if_address_is_in_use
 from nanotron import distributed as dist
+from nanotron.config.parallelism_config import ParallelismArgs
 
 
 def _check_groups_dp4_ep2(parallel_context):
@@ -98,9 +99,6 @@ def _check_rank_helpers(parallel_context):
 @rerun_if_address_is_in_use()
 def test_rank_helpers_dp4_ep2():
     init_distributed(tp=1, dp=4, pp=1, ep=2)(_check_rank_helpers)()
-
-
-from nanotron.config.parallelism_config import ParallelismArgs
 
 
 def test_parallelism_args_rejects_indivisible_ep():
