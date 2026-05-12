@@ -399,14 +399,27 @@ class SparseMLP(nn.Module):
             bias=False,
         )
 
-        mark_all_parameters_in_module_as_sharded(
-            self,
+        # For TP==1 we transpose w1 in place to the layout stk's sparse-dense matmul wants.
+        # The transpose must happen BEFORE marking, otherwise the marker captures
+        # `unsharded_shape` against the pre-transpose layout and save/load mismatch (saver
+        # writes the runtime/post-transpose tensor, loader allocates an unsharded buffer
+        # of the pre-transpose shape). w2 is never transposed, so it keeps split_dim=0.
+        if self.tp_pg.size() == 1:
+            self.w1.weight.data = self.w1.weight.data.T.contiguous()
+
+        from nanotron.parallel.sharded_parameters import create_sharded_parameter_from_config
+
+        w1_split_dim = 1 if self.tp_pg.size() == 1 else 0
+        self.w1.weight = create_sharded_parameter_from_config(
+            parameter=self.w1.weight,
+            pg=parallel_context.tp_and_expert_pg,
+            split_config=SplitConfig(split_dim=w1_split_dim),
+        )
+        self.w2.weight = create_sharded_parameter_from_config(
+            parameter=self.w2.weight,
             pg=parallel_context.tp_and_expert_pg,
             split_config=SplitConfig(split_dim=0),
         )
-
-        if self.tp_pg.size() == 1:
-            self.w1.weight.data = self.w1.weight.data.T.contiguous()
 
         # TODO @nouamane: jit
         self.act = partial(F.gelu, approximate="tanh")
