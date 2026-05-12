@@ -56,6 +56,10 @@ def _one_step_loss(parallel_context, seed: int, micro_batch: int, full_batch_see
         parallel_context=parallel_context,
         parallel_config=parallel_config,
     ).cuda()
+    # init_model_randomly expects a nested config object exposing
+    # `config.model.init_method.std` and `config.model.model_config`.
+    # We build the minimal stub it needs via anonymous type chains rather
+    # than importing the full Config dataclass machinery.
     model.init_model_randomly(
         config=type(
             "X",
