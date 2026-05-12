@@ -1,5 +1,5 @@
 import os
-from typing import Literal, Tuple, Annotated
+from typing import Literal, Tuple
 
 import numpy as np
 import torch
@@ -31,7 +31,8 @@ class ParallelContext:
         expected = tensor_parallel_size * pipeline_parallel_size * data_parallel_size
         if expected != world_size:
             raise ValueError(
-                f"TP*PP*DP ({expected}) must equal world size ({world_size}). "
+                f"TP*PP*DP = {tensor_parallel_size}*{pipeline_parallel_size}*{data_parallel_size} "
+                f"= {expected} must equal world size ({world_size}). "
                 f"Note: under EP-as-subset-of-DP, EP is NOT multiplied into world size."
             )
 
@@ -103,7 +104,9 @@ class ParallelContext:
                     )
         self.expert_dp_pg = self.create_new_group(np.array(edp_groups))
 
-        # Keep `expert_pg` as an alias for `ep_pg` so callers in moe.py and serialize/* keep working.
+        # `expert_pg` is a load-bearing alias for `ep_pg`: live callers exist in
+        # examples/moe/moe.py, src/nanotron/trainer.py, and src/nanotron/serialize/*.
+        # Kept until those modules migrate to `ep_pg` (no specific removal target yet).
         self.expert_pg = self.ep_pg
 
         # MP (non-expert clip-grad): TP x PP for a given dp_rank.
