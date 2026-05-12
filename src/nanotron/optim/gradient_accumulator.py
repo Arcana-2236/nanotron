@@ -130,12 +130,25 @@ class FP32GradientAccumulator(GradientAccumulator):
             # They are already synced
             return
 
+        # Filter out expert-marked parameters: those are reduced on expert_dp_pg by
+        # sync_expert_gradients; a second reduce on dp_pg would mix in non-replica peers.
+        from nanotron.parallel.data_parallel.utils import is_expert_param
+
         if reduce_scatter:
             # Usually you need to run `all_reduce` in order for all gradients to be synced.
             # However when the optimizer state are sharded, you really just need to scatter to ranks that are going to run the optimizer state.
             # Effectively you replace a `all_reduce` with a `reduce_scatter` which should save an `all_gather` when using RING algorithm.
             assert hasattr(self, "param_name_to_offsets")
-            named_offsets = sorted(self.param_name_to_offsets.items(), key=lambda x: x[0])
+            named_offsets = sorted(
+                (
+                    (name, offsets)
+                    for name, offsets in self.param_name_to_offsets.items()
+                    if not is_expert_param(self.fp32_grad_buffers[name]["half"])
+                ),
+                key=lambda x: x[0],
+            )
+            if not named_offsets:
+                return
             flat_grad_buffers = [self.fp32_grad_buffers[name]["fp32_grad"].view(-1) for name, _ in named_offsets]
             dist.reduce_scatter_coalesced(
                 output_tensor_list=[
@@ -152,7 +165,17 @@ class FP32GradientAccumulator(GradientAccumulator):
                 group=dp_pg,
             )
         else:
-            dist.all_reduce(self._contiguous_fp32_grad_buffer, op=reduce_op, group=dp_pg)
+            # Per-param coalesced all-reduce so we can skip expert grad buffers.
+            # The fp32_grad_buffers are views into _contiguous_fp32_grad_buffer, so
+            # reducing them in-place correctly updates the underlying storage.
+            non_expert_grad_buffers = [
+                elt["fp32_grad"]
+                for elt in self.fp32_grad_buffers.values()
+                if not is_expert_param(elt["half"])
+            ]
+            if not non_expert_grad_buffers:
+                return
+            dist.all_reduce_coalesced(non_expert_grad_buffers, op=reduce_op, group=dp_pg)
 
     @staticmethod
     def build_grad_buffers(

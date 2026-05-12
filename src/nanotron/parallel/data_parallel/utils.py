@@ -56,14 +56,21 @@ def sync_gradients_across_dp(
         reduce_op: The reduce operation to use.
         grad_accumulator: The gradient accumulator to use.
         sync_options: Additional options given when using `grad_accumulator`. Please look at `GradientAccumulator.sync_gradients_across_dp` for documentation
+
+    Note:
+        Expert-marked parameters are skipped here: they are reduced on `expert_dp_pg`
+        by `sync_expert_gradients` and a second reduce on `dp_pg` would mix in
+        non-replica peers.
     """
     if grad_accumulator is not None:
         # This is an optimized path that
         grad_accumulator.sync_gradients_across_dp(dp_pg=dp_pg, reduce_op=reduce_op, **sync_options)
         return
 
-    # Sync gradients
+    # Sync gradients (skip expert params -- those are reduced on expert_dp_pg).
     for name, param in module.named_parameters():
+        if is_expert_param(param):
+            continue
         dist.all_reduce(param.grad, op=reduce_op, group=dp_pg)
 
 
