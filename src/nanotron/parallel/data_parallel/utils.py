@@ -49,3 +49,30 @@ def sync_gradients_across_dp(
     # Sync gradients
     for name, param in module.named_parameters():
         dist.all_reduce(param.grad, op=reduce_op, group=dp_pg)
+
+
+def sync_expert_gradients(
+    module: nn.Module,
+    expert_dp_pg: dist.ProcessGroup,
+    reduce_op: dist.ReduceOp = dist.ReduceOp.AVG,
+    grad_accumulator: Optional[GradientAccumulator] = None,
+):
+    """All-reduce expert-parameter gradients across the expert-data-parallel group.
+
+    Expert parameters are those marked via `param._is_expert = True` by the trainer
+    when wrapping the model. When `expert_dp_pg.size() == 1` there is no reduction
+    to do and the call is a no-op.
+    """
+    if expert_dp_pg.size() == 1:
+        return
+
+    for name, param in module.named_parameters():
+        if not getattr(param, "_is_expert", False):
+            continue
+        if grad_accumulator is not None:
+            grad = grad_accumulator.get_grad_buffer(name=name)
+        else:
+            grad = param.grad
+        if grad is None:
+            continue
+        dist.all_reduce(grad, op=reduce_op, group=expert_dp_pg)

@@ -1,4 +1,5 @@
 import pytest
+import torch
 from helpers.utils import available_gpus, init_distributed, rerun_if_address_is_in_use
 from nanotron import distributed as dist
 from nanotron.config.parallelism_config import ParallelismArgs
@@ -99,6 +100,38 @@ def _check_rank_helpers(parallel_context):
 @rerun_if_address_is_in_use()
 def test_rank_helpers_dp4_ep2():
     init_distributed(tp=1, dp=4, pp=1, ep=2)(_check_rank_helpers)()
+
+
+def _check_expert_grad_reduced_on_expert_dp_pg(parallel_context):
+    """When expert_dp_pg.size() > 1, expert grads should be averaged across that group."""
+    if parallel_context.expert_dp_pg.size() == 1:
+        return  # nothing to test in this layout
+    # Build a fake expert-marked parameter and verify averaging.
+    p = torch.nn.Parameter(torch.zeros(2, device="cuda"))
+    p._is_expert = True
+    p.grad = torch.full_like(p.data, float(dist.get_rank(parallel_context.world_pg)))
+    from nanotron.parallel.data_parallel.utils import sync_expert_gradients
+
+    class Holder(torch.nn.Module):
+        def __init__(self, p):
+            super().__init__()
+            self.p = p
+
+    holder = Holder(p)
+    sync_expert_gradients(
+        module=holder,
+        expert_dp_pg=parallel_context.expert_dp_pg,
+        reduce_op=dist.ReduceOp.AVG,
+        grad_accumulator=None,
+    )
+    expected = sum(dist.get_process_group_ranks(parallel_context.expert_dp_pg)) / parallel_context.expert_dp_pg.size()
+    assert torch.allclose(p.grad, torch.full_like(p.grad, expected))
+
+
+@pytest.mark.skipif(available_gpus() < 4, reason="needs 4 gpus")
+@rerun_if_address_is_in_use()
+def test_expert_grad_reduced_dp4_ep2():
+    init_distributed(tp=1, dp=4, pp=1, ep=2)(_check_expert_grad_reduced_on_expert_dp_pg)()
 
 
 def test_parallelism_args_rejects_indivisible_ep():

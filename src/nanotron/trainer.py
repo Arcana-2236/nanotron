@@ -63,7 +63,7 @@ from nanotron.models.llama import LlamaForTraining, RotaryEmbedding
 from nanotron.models.starcoder2 import Starcoder2ForTraining
 from nanotron.optim.clip_grads import clip_grad_norm
 from nanotron.parallel import ParallelContext
-from nanotron.parallel.data_parallel.utils import sync_gradients_across_dp
+from nanotron.parallel.data_parallel.utils import sync_expert_gradients, sync_gradients_across_dp
 from nanotron.parallel.parameters import NanotronParameter, sanity_check
 from nanotron.parallel.pipeline_parallel.engine import (
     PipelineEngine,
@@ -691,6 +691,16 @@ class DistributedTrainer:
 
         after_tbi_sanity_checks(self.config, self.parallel_context, self.unwrapped_model, self.grad_accumulator)
 
+        # Reduce expert-parameter gradients across expert_dp_pg. Expert params are
+        # excluded from DDP's reducer in _init_model, so DDP only handles non-expert
+        # params on dp_pg; this call handles the orthogonal complement for experts.
+        sync_expert_gradients(
+            module=self.unwrapped_model,
+            expert_dp_pg=self.parallel_context.expert_dp_pg,
+            reduce_op=dist.ReduceOp.AVG,
+            grad_accumulator=self.grad_accumulator,
+        )
+
         if self.iteration_step >= self.initial_iter_step + 5:
             torch.cuda.nvtx.range_push("sync_gradients_across_dp")
         if isinstance(self.model, DistributedDataParallel) and self.grad_accumulator is not None:
@@ -1193,11 +1203,29 @@ class DistributedTrainer:
             rank=0,
         )
 
+        # Mark expert parameters so they (a) are excluded from DDP's reducer and
+        # (b) can be reduced separately on expert_dp_pg after backward.
+        expert_param_names = []
+        for name, param in model.named_parameters():
+            is_expert = False
+            if isinstance(param, NanotronParameter) and param.is_sharded:
+                if param.get_sharded_info().is_expert_sharded(parallel_context):
+                    is_expert = True
+            if not is_expert and ".block_sparse_moe.experts." in name:
+                is_expert = True
+            param._is_expert = is_expert
+            if is_expert:
+                expert_param_names.append(name)
+
         # Model make it DDP
         if make_ddp is True:
             # Check that the model has at least one grad. Necessary for DDP
             check_model_has_grad(model=model, parallel_context=parallel_context)
             # TODO @thomasw21: DDP doesn't support broadcasting complex buffers (and we don't really need that broadcasting anyway)
+            if expert_param_names:
+                DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(
+                    model, expert_param_names
+                )
             model = DistributedDataParallel(
                 model,
                 process_group=parallel_context.dp_pg,
