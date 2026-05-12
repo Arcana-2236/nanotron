@@ -10,7 +10,24 @@ from nanotron.logging import get_logger, log_rank
 from nanotron.models import NanotronModel
 from nanotron.optim.gradient_accumulator import GradientAccumulator
 from nanotron.parallel import ParallelContext
+from nanotron.parallel.data_parallel.utils import is_expert_param
 from nanotron.parallel.tied_parameters import get_tied_id_to_param
+
+
+def sync_pg_for_param(param, name: str, parallel_context: ParallelContext) -> dist.ProcessGroup:
+    """Process group across which `param` (or the tensor referenced by `name`) should be
+    bit-identical at sanity-check time.
+
+    Under EP-as-subset-of-DP, expert params live uniquely per dp_rank; their replicas
+    live across `expert_dp_pg` (size DP_total // EP). Non-expert params are replicated
+    across the full `dp_pg`. `is_expert_param` requires a Parameter; for raw state_dict
+    tensors (which lose Parameter metadata) we fall back to the canonical name pattern.
+    """
+    if isinstance(param, torch.nn.Parameter) and is_expert_param(param):
+        return parallel_context.expert_dp_pg
+    if ".block_sparse_moe.experts." in name:
+        return parallel_context.expert_dp_pg
+    return parallel_context.dp_pg
 
 logger = get_logger(__name__)
 
@@ -61,11 +78,15 @@ def before_tbi_sanity_checks(
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
 ) -> None:
     if not config.general.ignore_sanity_checks:
-        # SANITY CHECK: Check that the model params are synchronized across dp
+        # SANITY CHECK: Check that the model params are synchronized across dp (non-expert)
+        # or expert_dp (expert). Under DP=EP the expert group has size 1 — skipped.
         for name, param in sorted(unwrapped_model.named_parameters(), key=lambda x: x[0]):
+            pg = sync_pg_for_param(param, name, parallel_context)
+            if pg.size() == 1:
+                continue
             assert_tensor_synced_across_pg(
                 tensor=param,
-                pg=parallel_context.dp_pg,
+                pg=pg,
                 msg=lambda err: f"{name} are not synchronized across DP {err}",
             )
 
@@ -205,17 +226,24 @@ def before_optim_step_sanity_checks(
                 grad = param.grad
 
             assert grad is not None, f"Grad is None for {name}"
+            pg = sync_pg_for_param(param, name, parallel_context)
+            if pg.size() == 1:
+                continue
             assert_tensor_synced_across_pg(
                 tensor=grad,
-                pg=parallel_context.dp_pg,
+                pg=pg,
                 msg=lambda err: f"[Before optimizer step] weights grads for {name} are not synchronized across DP. {err}",
             )
 
-        # SANITY CHECK: Check that the model params are synchronized across dp
+        # SANITY CHECK: Check that the model params are synchronized across dp (non-expert)
+        # or expert_dp (expert).
         for name, param in sorted(unwrapped_model.named_parameters(), key=lambda x: x[0]):
+            pg = sync_pg_for_param(param, name, parallel_context)
+            if pg.size() == 1:
+                continue
             assert_tensor_synced_across_pg(
                 tensor=param,
-                pg=parallel_context.dp_pg,
+                pg=pg,
                 msg=lambda err: f"{name} are not synchronized across DP {err}",
             )
 
@@ -234,7 +262,8 @@ def before_optim_step_sanity_checks(
             )
 
         # SANITY CHECK: Check that optimizer states are synchronized across DP
-        check_optim_state_in_sync(optimizer.state_dict(), parallel_context.dp_pg)
+        # (non-expert) or expert_dp (expert).
+        check_optim_state_in_sync(optimizer, parallel_context)
 
         # SANITY CHECK: run model specific sanity checks
         unwrapped_model.before_optim_step_sanity_checks()
@@ -263,8 +292,32 @@ def after_optim_step_sanity_checks(
         unwrapped_model.after_optim_step_sanity_checks()
 
 
-def check_optim_state_in_sync(optim_state_dict: dict, pg: dist.ProcessGroup):
-    for _, optim_state in sorted(optim_state_dict["state"].items(), key=lambda x: x[0]):
+def check_optim_state_in_sync(
+    optimizer: "optim.BaseOptimizer",
+    parallel_context: ParallelContext,
+):
+    """Per-param sync check: non-expert state is compared across dp_pg, expert state
+    across expert_dp_pg. Under DP=EP the expert group is size 1 and the check is a no-op
+    for expert state."""
+    # Build state-index → Parameter map by walking the param groups in the SAME order
+    # as the state_dict (state_dict numbers params sequentially through param_groups).
+    state_dict = optimizer.state_dict()
+    index_to_param = {}
+    state_index = 0
+    for real_group in optimizer.param_groups:
+        for param in real_group["params"]:
+            index_to_param[state_index] = param
+            state_index += 1
+
+    for idx, optim_state in sorted(state_dict["state"].items(), key=lambda x: x[0]):
+        param = index_to_param.get(idx)
+        pg = (
+            parallel_context.expert_dp_pg
+            if isinstance(param, torch.nn.Parameter) and is_expert_param(param)
+            else parallel_context.dp_pg
+        )
+        if pg.size() == 1:
+            continue
         for name, tensor in optim_state.items():
             # Skip non-tensor states (e.g. Python-int step counters like Adam's "step"
             # or Muon's "muon_step").  These cannot be broadcast and are always in sync
