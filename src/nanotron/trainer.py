@@ -63,7 +63,12 @@ from nanotron.models.llama import LlamaForTraining, RotaryEmbedding
 from nanotron.models.starcoder2 import Starcoder2ForTraining
 from nanotron.optim.clip_grads import clip_grad_norm
 from nanotron.parallel import ParallelContext
-from nanotron.parallel.data_parallel.utils import mark_expert, sync_expert_gradients, sync_gradients_across_dp
+from nanotron.parallel.data_parallel.utils import (
+    is_expert_param,
+    mark_expert,
+    sync_expert_gradients,
+    sync_gradients_across_dp,
+)
 from nanotron.parallel.parameters import NanotronParameter, sanity_check
 from nanotron.parallel.pipeline_parallel.engine import (
     PipelineEngine,
@@ -736,17 +741,32 @@ class DistributedTrainer:
         # Clip gradients
         if self.config.optimizer.clip_grad is not None:
             # Unwrap DDP
-            named_parameters = [
+            all_named_parameters = [
                 (name, param)
                 for name, param in self.unwrapped_model.get_named_params_with_correct_tied()
                 if param.requires_grad
             ]
-            self.grad_norm_unclipped = clip_grad_norm(
+            non_expert_named = [(n, p) for n, p in all_named_parameters if not is_expert_param(p)]
+            expert_named = [(n, p) for n, p in all_named_parameters if is_expert_param(p)]
+
+            non_expert_norm = clip_grad_norm(
                 mp_pg=self.parallel_context.mp_pg,
-                named_parameters=named_parameters,
+                named_parameters=non_expert_named,
                 grad_accumulator=self.grad_accumulator,
                 max_norm=self.config.optimizer.clip_grad,
             )
+            if expert_named:
+                expert_norm = clip_grad_norm(
+                    mp_pg=self.parallel_context.expert_mp_pg,
+                    named_parameters=expert_named,
+                    grad_accumulator=self.grad_accumulator,
+                    max_norm=self.config.optimizer.clip_grad,
+                )
+                self.grad_norm_unclipped = torch.linalg.vector_norm(
+                    torch.stack([non_expert_norm, expert_norm])
+                )
+            else:
+                self.grad_norm_unclipped = non_expert_norm
         if self.iteration_step >= self.initial_iter_step + 5:
             torch.cuda.nvtx.range_pop()
 
@@ -1152,15 +1172,20 @@ class DistributedTrainer:
                 dist.all_reduce(t, group=g, async_op=False, op=dist.ReduceOp.SUM)
             return t.item()
 
+        # Non-expert: sum over TP and PP (each unique shard lives once per dp_rank;
+        # we want the per-model count, not per-DP-replica). DP must NOT be summed.
         other_num = _reduce(local_other_num, [parallel_context.tp_pg, parallel_context.pp_pg])
         other_sz = _reduce(local_other_sz, [parallel_context.tp_pg, parallel_context.pp_pg])
+
+        # Expert: sum over TP, PP, and EP (each expert lives on one ep_rank per
+        # expert_dp_pg). expert_dp must NOT be summed.
         expert_num = _reduce(
             local_expert_num,
-            [parallel_context.tp_pg, parallel_context.expert_pg, parallel_context.pp_pg],
+            [parallel_context.tp_pg, parallel_context.ep_pg, parallel_context.pp_pg],
         )
         expert_sz = _reduce(
             local_expert_sz,
-            [parallel_context.tp_pg, parallel_context.expert_pg, parallel_context.pp_pg],
+            [parallel_context.tp_pg, parallel_context.ep_pg, parallel_context.pp_pg],
         )
         total_num = other_num + expert_num
         total_sz = other_sz + expert_sz
