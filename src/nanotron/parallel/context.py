@@ -18,21 +18,21 @@ class ParallelContext:
         expert_parallel_size: int = 1,
         backend: DistributedBackend = "nccl",
     ):
-        """Initialize parallel context."""
-        num_gpus_per_model = tensor_parallel_size * pipeline_parallel_size * expert_parallel_size
+        """Initialize parallel context.
+
+        Layout: world_size = TP * PP * DP. `expert_parallel_size` subdivides DP
+        (it is NOT multiplied into world size). Must satisfy DP % EP == 0.
+        """
         world_size = int(os.environ["WORLD_SIZE"])
 
         assert (
-            world_size % data_parallel_size == 0
-        ), "The total number of processes must be divisible by the data parallel size."
-        assert world_size % num_gpus_per_model == 0, (
-            "The total number of processes must be divisible by"
-            "the number of GPUs per model (tensor_parallel_size * pipeline_parallel_size)."
-        )
-        if num_gpus_per_model * data_parallel_size != world_size:
+            data_parallel_size % expert_parallel_size == 0
+        ), f"data_parallel_size ({data_parallel_size}) must be divisible by expert_parallel_size ({expert_parallel_size})."
+        expected = tensor_parallel_size * pipeline_parallel_size * data_parallel_size
+        if expected != world_size:
             raise ValueError(
-                f"The number of process requires to run all replicas ({num_gpus_per_model * data_parallel_size})",
-                f"must be equal to the world size ({world_size}).",
+                f"TP*PP*DP ({expected}) must equal world size ({world_size}). "
+                f"Note: under EP-as-subset-of-DP, EP is NOT multiplied into world size."
             )
 
         if not dist.is_available():
@@ -52,7 +52,6 @@ class ParallelContext:
         if not dist.is_initialized():
             dist.initialize_torch_distributed()
 
-        world_size = int(os.getenv("WORLD_SIZE", "1"))
         ranks = list(range(world_size))
         process_group = dist.new_group(
             ranks=ranks,
@@ -63,12 +62,12 @@ class ParallelContext:
         self._init_parallel_groups()
 
     def _init_parallel_groups(self):
-        """Initialize 3D parallelism's all process groups."""
+        """Initialize 3D parallelism's all process groups under the new EP-as-subset-of-DP layout."""
         dist.barrier()
         world_size = int(os.environ["WORLD_SIZE"])
+        # New 3-D layout: [PP, DP_total, TP]
         ranks = np.arange(0, world_size).reshape(
             (
-                self.expert_parallel_size,
                 self.pipeline_parallel_size,
                 self.data_parallel_size,
                 self.tensor_parallel_size,
@@ -76,24 +75,74 @@ class ParallelContext:
         )
         self.world_ranks_to_pg = {}
 
-        # Relevant process groups containing the current rank
-        self.tp_pg = self.create_new_group(ranks.transpose((0, 1, 2, 3)).reshape((-1, self.tensor_parallel_size)))
-        self.dp_pg = self.create_new_group(ranks.transpose((3, 0, 1, 2)).reshape((-1, self.data_parallel_size)))
-        self.pp_pg = self.create_new_group(ranks.transpose((2, 3, 0, 1)).reshape((-1, self.pipeline_parallel_size)))
-        self.expert_pg = self.create_new_group(ranks.transpose((1, 2, 3, 0)).reshape((-1, self.expert_parallel_size)))
+        # TP: vary tp_rank with everything else fixed.
+        self.tp_pg = self.create_new_group(ranks.reshape((-1, self.tensor_parallel_size)))
+        # DP: vary dp_rank with everything else fixed.
+        self.dp_pg = self.create_new_group(ranks.transpose((2, 0, 1)).reshape((-1, self.data_parallel_size)))
+        # PP: vary pp_rank with everything else fixed.
+        self.pp_pg = self.create_new_group(ranks.transpose((1, 2, 0)).reshape((-1, self.pipeline_parallel_size)))
 
-        # model parallel group = combination of tp and pp and exp for a given dp rank
+        # EP: contiguous size-`expert_parallel_size` sub-range INSIDE dp_pg.
+        # For each (pp, tp), split the dp axis into groups of size EP.
+        ep = self.expert_parallel_size
+        num_ep_groups_per_slot = self.data_parallel_size // ep
+        ep_groups = []
+        for pp_rank in range(self.pipeline_parallel_size):
+            for tp_rank in range(self.tensor_parallel_size):
+                for g in range(num_ep_groups_per_slot):
+                    ep_groups.append(ranks[pp_rank, g * ep : (g + 1) * ep, tp_rank])
+        self.ep_pg = self.create_new_group(np.array(ep_groups))
+
+        # expert_dp: orthogonal complement of EP inside DP -- same intra-EP rank across all EP groups.
+        edp_groups = []
+        for pp_rank in range(self.pipeline_parallel_size):
+            for tp_rank in range(self.tensor_parallel_size):
+                for intra in range(ep):
+                    edp_groups.append(
+                        np.array([ranks[pp_rank, g * ep + intra, tp_rank] for g in range(num_ep_groups_per_slot)])
+                    )
+        self.expert_dp_pg = self.create_new_group(np.array(edp_groups))
+
+        # Keep `expert_pg` as an alias for `ep_pg` so callers in moe.py and serialize/* keep working.
+        self.expert_pg = self.ep_pg
+
+        # MP (non-expert clip-grad): TP x PP for a given dp_rank.
         self.mp_pg = self.create_new_group(
-            [ranks[:, :, dp_rank, :].reshape(-1) for dp_rank in range(self.data_parallel_size)]
+            [ranks[:, dp_rank, :].reshape(-1) for dp_rank in range(self.data_parallel_size)]
         )
 
-        self.tp_and_expert_pg = self.create_new_group(
-            [
-                ranks[:, pp_rank, dp_rank, :].reshape(-1)
-                for pp_rank in range(self.pipeline_parallel_size)
-                for dp_rank in range(self.data_parallel_size)
-            ]
-        )
+        # expert MP (expert clip-grad): TP x PP x EP for a given expert_dp coordinate.
+        expert_mp_groups = []
+        for intra in range(ep):
+            for edp in range(num_ep_groups_per_slot):
+                expert_mp_groups.append(
+                    np.array(
+                        [
+                            ranks[pp_rank, edp * ep + ep_inner, tp_rank]
+                            for pp_rank in range(self.pipeline_parallel_size)
+                            for tp_rank in range(self.tensor_parallel_size)
+                            for ep_inner in range(ep)
+                        ]
+                    )
+                )
+                break  # all `intra` produce the same expert-MP membership; one is enough
+        # Deduplicate by sorted tuple (create_new_group already does this, but be explicit).
+        self.expert_mp_pg = self.create_new_group(np.array(expert_mp_groups))
+
+        # tp_and_expert_pg: TP x EP for a given (pp, expert_dp) -- used by SparseMLP marker.
+        tae_groups = []
+        for pp_rank in range(self.pipeline_parallel_size):
+            for edp in range(num_ep_groups_per_slot):
+                tae_groups.append(
+                    np.array(
+                        [
+                            ranks[pp_rank, edp * ep + ep_inner, tp_rank]
+                            for tp_rank in range(self.tensor_parallel_size)
+                            for ep_inner in range(ep)
+                        ]
+                    )
+                )
+        self.tp_and_expert_pg = self.create_new_group(np.array(tae_groups))
 
         self.world_rank_matrix: np.ndarray = ranks
 
@@ -137,7 +186,6 @@ class ParallelContext:
 
     def get_global_rank(
         self,
-        ep_rank: int,
         pp_rank: int,
         dp_rank: int,
         tp_rank: int,
@@ -145,11 +193,14 @@ class ParallelContext:
         """
         Get the global rank based on the specified ranks in different parallel groups.
 
-        :param ep_rank: int, Rank in the expert parallel group.
+        Under the new EP-as-subset-of-DP layout, the world_rank_matrix is 3-D
+        [PP, DP_total, TP]; the EP coordinate is embedded in dp_rank (specifically,
+        ep_rank = dp_rank % expert_parallel_size).
+
         :param pp_rank: int, Rank in the pipeline parallel group.
-        :param dp_rank: int, Rank in the data parallel group.
+        :param dp_rank: int, Rank in the data parallel group (spans the full DP world).
         :param tp_rank: int, Rank in the tensor parallel group.
 
         :return: numpy.int64, The global rank.
         """
-        return self.world_rank_matrix[ep_rank, pp_rank, dp_rank, tp_rank]
+        return self.world_rank_matrix[pp_rank, dp_rank, tp_rank]
