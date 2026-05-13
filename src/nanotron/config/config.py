@@ -678,6 +678,10 @@ def apply_config_overrides(config, args):
         config.parallelism.pp = args.pp
         overrides_applied.append(f"parallelism.pp = {args.pp}")
 
+    if hasattr(args, "ep") and args.ep is not None:
+        config.parallelism.expert_parallel_size = args.ep
+        overrides_applied.append(f"parallelism.expert_parallel_size = {args.ep}")
+
     # Log applied overrides
     if overrides_applied:
         logger.info("=" * 50)

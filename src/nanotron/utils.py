@@ -295,6 +295,12 @@ def get_args():
         default=None,
         help="Override pp (parallelism.pp)",
     )
+    parser.add_argument(
+        "--ep",
+        type=int,
+        default=None,
+        help="Override ep (parallelism.expert_parallel_size)",
+    )
 
     # Generic dotted-path overrides (e.g. --override optimizer.optimizer_factory.muon_mode=sgd)
     parser.add_argument(
