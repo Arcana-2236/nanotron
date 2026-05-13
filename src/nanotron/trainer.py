@@ -1319,9 +1319,13 @@ class DistributedTrainer:
             model=self.unwrapped_model,
             optimizer=self.optimizer,
             lr_scheduler=self.lr_scheduler,
-            should_save_model=bool(
-                dist.get_rank(self.parallel_context.dp_pg) == 0
-            ),  # We only save the weights on DP==0
+            # Every rank that owns a unique expert shard must enter save_weights so
+            # save_weights' per-param filter (non-expert: dp_rank==0; expert:
+            # expert_dp_rank==0) can run. Gating here on dp_rank==0 would let only
+            # rank 0 write -- it would save its experts (exp-rank-0) and silently
+            # drop the other EP-1 shards. The per-param filter inside save_weights
+            # produces the right file set when all ranks are admitted.
+            should_save_model=True,
             should_save_optimizer=True,
             should_save_lr_scheduler=True,
             should_save_config=bool(
